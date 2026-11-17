@@ -10,6 +10,7 @@ const RuntimeServer = require('../dist/controller/RuntimeServer.js').default;
 const {programmeFingerprint, WEEKDAYS} = require('../dist/programmes.js');
 const {toEditor} = require('../dist/controller/EditorProgramme.js');
 const {createThermostatControlPolicy} = require('../dist/controller/ControlPolicy.js');
+const {getThermostatNowNext} = require('../dist/controller/NowNext.js');
 
 const clone = value => structuredClone(value);
 const programme = (temperature = 18.5) => Object.fromEntries(WEEKDAYS.map(day => [day, [
@@ -31,7 +32,14 @@ class FakeProvider {
       limits: {minC: 5, maxC: id === 'tuya' ? 40 : 32, stepC: 0.5}, periods: {min: id === 'tuya' ? 4 : 1, max: id === 'tuya' ? 4 : 6}};
   }
   async list() {this.calls.push({operation: 'list'}); if (this.listError) throw new Error(this.listError); return [clone(this.zone)];}
-  async read(deviceId) {this.calls.push({operation: 'read', deviceId}); if (this.readError) throw new Error(this.readError); return clone(this.zone);}
+  async read(deviceId) {
+    this.calls.push({operation: 'read', deviceId}); if (this.readError) throw new Error(this.readError);
+    if (this.id === 'tuya') {
+      this.zone.targetReadAt = Date.now();
+      this.zone.targetC = getThermostatNowNext(toEditor(this.zone.programme), {timeZone: 'Europe/London', clockVerified: true}).current.temperature;
+    }
+    return {...clone(this.zone), ...this.readbackPatch};
+  }
   async prepare(deviceId, desired, expectedFingerprint, options = {}) {
     this.calls.push({operation: 'prepare', deviceId, desired: clone(desired), expectedFingerprint, options: clone(options)});
     if (this.beforePrepare) await this.beforePrepare();
@@ -40,7 +48,8 @@ class FakeProvider {
     }
     if (expectedFingerprint && expectedFingerprint !== this.zone.fingerprint) throw new Error('BASELINE_CHANGED');
     const preview = {token: crypto.randomUUID(), deviceId, programme: clone(desired),
-      expiresAt: Date.now() + (this.previewTtl ?? 300000), changesRequired: programmeFingerprint(desired) !== this.zone.fingerprint};
+      expiresAt: Date.now() + (this.previewTtl ?? 300000), changesRequired: programmeFingerprint(desired) !== this.zone.fingerprint,
+      ...(options.activeTarget ? {activeTarget: clone(options.activeTarget)} : {})};
     this.previews.set(preview.token, preview);
     return clone(preview);
   }
@@ -58,10 +67,14 @@ class FakeProvider {
       this.zone.programme = clone(preview.programme);
       this.zone.fingerprint = programmeFingerprint(preview.programme);
       this.zone.readAt = Date.now();
+      if (preview.activeTarget) {
+        this.zone.targetReadAt = Date.now();
+        this.zone.targetC = getThermostatNowNext(toEditor(preview.programme), {...preview.activeTarget, clockVerified: true}).current.temperature;
+      }
     }
     return {status: outcome === 'unknown-matching' ? 'unknown' : outcome,
       reason: outcome === 'confirmed' ? 'Complete week confirmed' : 'Write outcome could not be verified',
-      writeAttempted: outcome !== 'not-applied', readback: clone(this.zone)};
+      writeAttempted: outcome !== 'not-applied', readback: {...clone(this.zone), ...this.applyReadbackPatch}};
   }
   get writes() {return this.calls.filter(call => call.operation === 'apply');}
 }
@@ -74,7 +87,7 @@ test('automatic selection prepares one guarded fresh baseline without a separate
     await controller.handle('/presence', {home: false});
     await settled(controller);
     assert.deepEqual(tuya.calls.map(call => call.operation), ['prepare', 'apply']);
-    assert.deepEqual(tuya.calls[0].options, {requireScheduled: true});
+    assert.deepEqual(tuya.calls[0].options, {requireScheduled: true, activeTarget: {timeZone: 'Europe/London'}});
     assert.equal(controller.view().thermostats[0].sync.confirmedProfile, 'away');
     assert.equal(controller.view().thermostats[0].programmeWriteMode, 'grouped-events');
   });
@@ -718,7 +731,8 @@ for (const system of ['tuya', 'hive']) {
       assert.equal(controller.view().thermostats[0].sync.confirmedProfile, 'home');
       assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, true);
       assert.deepEqual(provider.calls.filter(call => call.operation === 'prepare').map(call => call.options),
-        [{requireScheduled: true}, {requireScheduled: true}]);
+        Array.from({length: 2}, () => ({requireScheduled: true,
+          ...(system === 'tuya' ? {activeTarget: {timeZone: 'Europe/London'}} : {})})));
       assert.equal(provider.calls.some(call => call.operation === 'read'), false, 'controller adds no separate baseline read');
     });
   });
@@ -939,5 +953,71 @@ test('a supersession flag cannot turn an unknown write into an identical automat
     gate.resolve(); await settled(controller);
     assert.equal(tuya.writes.length, 1); assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, false);
     assert.equal(controller.view().thermostats[0].sync.status, 'failed');
+  });
+});
+
+test('a complete FastWarm week cannot confirm while its current target is wrong', async () => {
+  const tuya = new FakeProvider('tuya'); tuya.applyReadbackPatch = {targetC: 5};
+  await fixture([tuya], async ({controller}) => {
+    await controller.handle('/holiday', {active: true}); await settled(controller);
+    const room = controller.view().thermostats[0];
+    assert.equal(tuya.writes.length, 1);
+    assert.deepEqual(tuya.zone.programme, drafts().holiday);
+    assert.equal(room.sync.confirmationMatchesRequested, false);
+    assert.match(room.sync.error, /current target temperature/);
+    await controller.handle('/holiday', {active: true}); await settled(controller);
+    assert.equal(tuya.writes.length, 1, 'failed identical requests are not replayed to repair target proof');
+  });
+});
+
+test('read-only verification requires a fresh matching FastWarm target before clearing a failure', async () => {
+  const tuya = new FakeProvider('tuya'); tuya.outcomes.push('unknown-matching');
+  await fixture([tuya], async ({controller}) => {
+    await controller.handle('/home', {home: false}); await settled(controller);
+    tuya.readbackPatch = {targetC: 5};
+    await controller.handle('/schedules/read', {deviceIds: ['tuya:zone1'], verifyProfile: 'away'}); await settled(controller);
+    assert.match(controller.view().thermostats[0].sync.error, /current target temperature/);
+    assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, false);
+    tuya.readbackPatch = {targetReadAt: Date.now() - 60000};
+    await controller.handle('/schedules/read', {deviceIds: ['tuya:zone1'], verifyProfile: 'away'}); await settled(controller);
+    assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, false, 'a cached target timestamp cannot verify');
+    delete tuya.readbackPatch;
+    await controller.handle('/schedules/read', {deviceIds: ['tuya:zone1'], verifyProfile: 'away'}); await settled(controller);
+    assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, true);
+    assert.equal(tuya.writes.length, 1, 'verification reads send no heating writes');
+  });
+});
+
+test('changing a FastWarm time zone cancels an in-flight automatic target request', async () => {
+  const tuya = new FakeProvider('tuya'), entered = deferred(), gate = deferred(); tuya.honourAbort = true;
+  tuya.beforeApply = async (_preview, options) => {entered.resolve(options.signal); await gate.promise;};
+  await fixture([tuya], async ({controller}) => {
+    await controller.handle('/home', {home: false}); const signal = await entered.promise;
+    await controller.handle('/rooms/save', {deviceId: 'tuya:zone1', timeZone: 'America/New_York'});
+    assert.equal(signal.aborted, true);
+    gate.resolve(); await settled(controller);
+    assert.deepEqual(tuya.zone.programme, programme(), 'cancelled unsent operation does not apply its programme');
+    assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, false);
+  });
+});
+
+test('manual FastWarm preview binds its reviewed time zone and refuses an edited zone before dispatch', async () => {
+  const tuya = new FakeProvider('tuya');
+  await fixture([tuya], async ({controller}) => {
+    const reviewed = await controller.handle('/schedules/apply', {deviceIds: ['tuya:zone1'], profile: 'away', preview: true});
+    assert.deepEqual(tuya.calls.find(c => c.operation === 'prepare').options, {activeTarget: {timeZone: 'Europe/London'}});
+    await controller.handle('/rooms/save', {deviceId: 'tuya:zone1', timeZone: 'America/New_York'});
+    await assert.rejects(controller.handle('/schedules/apply', {previewId: reviewed.preview.id}), /time zone changed/);
+    assert.equal(tuya.writes.length, 0);
+  });
+});
+
+test('physical-clock confirmation remains independent of active-target alignment', async () => {
+  const tuya = new FakeProvider('tuya');
+  await fixture([tuya], async ({controller, readState}) => {
+    await controller.handle('/rooms/save', {deviceId: 'tuya:zone1', clockVerified: false});
+    await controller.handle('/home', {home: false}); await settled(controller);
+    assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, true);
+    assert.equal((await readState()).rooms['tuya:zone1'].clockVerified, false);
   });
 });

@@ -6,8 +6,8 @@ operations. This plugin owns saved Home/Away/Holiday programmes, household
 presence, guest hold, Holiday return/preheat, history, and one Heating
 accessory containing independent Home and Holiday switches in Apple Home.
 
-This local development build is **0.1.0-jdipper.8**. It is not an npm publication.
-Install it together with the Tuya device-provider build **2.7.3-jdipper.7** and the
+This local development build is **0.1.0-jdipper.9**. It is not an npm publication.
+Install it together with the Tuya device-provider build **2.7.3-jdipper.9** and the
 scoped Hive provider **`@jdipper/homebridge-hivehome-control` 1.1.0-jdipper.4**.
 The existing unscoped Hive provider build **1.1.0-jdipper.2** remains compatible
 while an installation moves to the scoped package. Do not run the old Tuya household controller
@@ -27,6 +27,15 @@ and its actual first event time. A bulk draft is checked against every selected
 room's capabilities before any copies are changed. Use **Review & apply** for a
 manual change. Every system is uploaded and verified separately; one room can
 succeed while another needs attention. Uncertain results are not retried.
+
+FastWarm programme selections also apply the temperature of the currently active
+period while retaining Smart mode. Confirmation and read-only profile verification
+require both the complete stored week and a fresh matching native target. The room’s
+configured IANA time zone determines the active period; a time-zone edit invalidates
+a reviewed preview or cancels obsolete automatic work. A target already matching
+requires no extra command. A differing target normally adds one individual target
+command and one read, with bounded read-only rechecks for delayed reports. Grouped
+programme uploads and their existing API savings are retained.
 
 Save all three profiles before enabling automatic household changes for a room.
 Hive is initially read-only until uploads and that specific zone are deliberately
@@ -220,6 +229,13 @@ request-count regressions. A complete no-change check was measured live at nine
 cold and eight warm. Membership, online state, native mode and individual complete
 readbacks remain fresh checks; hardware confirmation is never inferred from one
 group acknowledgement. Authentication, retries and unrelated polling are extra.
+
+Those figures describe programme storage. The `.9` active-target check shares
+the existing native control reads. When a room's target differs from its newly
+selected active period, correction normally adds one individual command and one
+verification read for that room. A matching target adds neither; delayed reports
+permit at most three read-only verification attempts. No extra target polling is
+introduced between profile selections.
 
 With the paired `.7` Tuya provider, superseding an automatic request sends a
 private local cancellation message, not a cloud request. Unsent commands stop at
