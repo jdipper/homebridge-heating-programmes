@@ -48,13 +48,15 @@ async function fixture(t, options = {}) {
         token: previewToken, deviceId, programme: body.programme, expiresAt: Date.now() + 300_000, changesRequired: true,
         ...(body.requireScheduled === true && !options.oldProvider ? {requireScheduled: true} : {}),
         ...(req.url === '/provider/prepare-automatic' ? {automaticFreshBaseline: true} : {}),
+        ...(body.activeTarget ? {activeTarget: body.activeTarget} : {}),
       }};
       else if (req.url === '/provider/discard') payload = {discarded: true};
       else if (req.url === '/provider/cancel-automatic') payload = {cancelled: true};
       else if (req.url === '/provider/apply' || req.url === '/provider/apply-automatic') payload = {
         ...(req.url === '/provider/apply-automatic' ? {automaticFreshBaseline: true} : {}), result: {
         status: 'confirmed', reason: 'Full week and Scheduled mode confirmed.', writeAttempted: true,
-        readback: {...zone, programme: desired, fingerprint: 'd'.repeat(64), readAt: Date.now()},
+        readback: {...zone, programme: desired, fingerprint: 'd'.repeat(64), readAt: Date.now(),
+          ...(descriptor.capabilities?.activeTargetAlignment ? {targetC: 19, targetReadAt: Date.now()} : {})},
       }};
       const replacement = options.reply?.({route: req.url, body, payload, zone});
       await options.beforeReply?.({route: req.url, body});
@@ -508,4 +510,71 @@ test('a matching automatic readback without its runtime proof remains unknown an
   const preview = await client.prepare(deviceId, desired, undefined, {requireScheduled: true});
   assert.equal((await client.apply(preview.token)).status, 'unknown');
   assert.equal(seen.filter(call => call.route === '/provider/apply-automatic').length, 1);
+});
+
+test('active-target context requires an advertised capability before any preparation request', async t => {
+  const {client, seen} = await fixture(t);
+  await assert.rejects(client.prepare(deviceId, desired, undefined, {requireScheduled: true,
+    activeTarget: {timeZone: 'Europe/London'}}), /ACTIVE_TARGET_ALIGNMENT_REQUIRED/);
+  assert.equal(seen.length, 0);
+});
+
+test('invalid or expanded active-target context cannot reach the provider', async t => {
+  const {client, seen} = await fixture(t, {descriptor: {capabilities: {activeTargetAlignment: true}}});
+  for (const activeTarget of [{timeZone: 'bad/zone'}, {timeZone: 'Europe/London', targetC: 19}, {}]) {
+    await assert.rejects(client.prepare(deviceId, desired, undefined, {activeTarget}), /INVALID_ACTIVE_TARGET/);
+  }
+  assert.equal(seen.length, 0);
+});
+
+for (const [name, context] of [['missing', undefined], ['altered', {timeZone: 'America/New_York'}],
+  ['expanded', {timeZone: 'Europe/London', targetC: 19}]]) {
+  test(`a ${name} active-target preview echo cannot authorize an apply`, async t => {
+    const {client, seen} = await fixture(t, {descriptor: {capabilities: {activeTargetAlignment: true}},
+      reply: ({payload}) => ({preview: {...payload.preview, activeTarget: context}})});
+    await assert.rejects(client.prepare(deviceId, desired, undefined, {activeTarget: {timeZone: 'Europe/London'}}),
+      /ACTIVE_TARGET_GUARD_REQUIRED/);
+    assert.equal((await client.apply(previewToken)).writeAttempted, false);
+    assert.equal(seen.length, 1);
+  });
+}
+
+test('a target-aware automatic apply carries the reviewed zone and confirms fresh native target proof without extra calls', async t => {
+  const activeTarget = {timeZone: 'Europe/London'};
+  const {client, seen} = await fixture(t, {descriptor: {capabilities: {automaticFreshBaseline: true,
+    automaticCancellation: true, activeTargetAlignment: true}}});
+  const preview = await client.prepare(deviceId, desired, undefined, {requireScheduled: true, activeTarget});
+  assert.deepEqual(preview.activeTarget, activeTarget);
+  assert.deepEqual(seen[0].body.activeTarget, activeTarget);
+  const result = await client.apply(preview.token);
+  assert.equal(result.status, 'confirmed');
+  assert.equal(result.readback.targetC, 19);
+  assert.ok(result.readback.targetReadAt <= Date.now());
+  assert.deepEqual(seen.map(r => r.route), ['/provider/prepare-automatic', '/provider/apply-automatic']);
+});
+
+for (const [name, patch] of [['missing target time', {}], ['old target', {targetC: 20}],
+  ['stale target time', {targetReadAt: 1}], ['future target time', {targetReadAt: Date.now() + 3600000}]]) {
+  test(`${name} cannot confirm a target-aware apply or permit a replay`, async t => {
+    const {client, seen} = await fixture(t, {descriptor: {capabilities: {activeTargetAlignment: true}},
+      reply: ({route, payload}) => {
+        if (route !== '/provider/apply') return {};
+        const readback = {...payload.result.readback, ...patch};
+        if (name === 'missing target time') delete readback.targetReadAt;
+        return {result: {...payload.result, readback}};
+      }});
+    const preview = await client.prepare(deviceId, desired, undefined, {activeTarget: {timeZone: 'Europe/London'}});
+    const result = await client.apply(preview.token);
+    assert.equal(result.status, 'unknown'); assert.equal(result.writeAttempted, true);
+    assert.equal((await client.apply(preview.token)).writeAttempted, false);
+    assert.equal(seen.filter(r => r.route === '/provider/apply').length, 1);
+  });
+}
+
+test('withdrawing active-target capability stops a reviewed apply before dispatch', async t => {
+  const {client, seen, descriptor, descriptorPath} = await fixture(t, {descriptor: {capabilities: {activeTargetAlignment: true}}});
+  const preview = await client.prepare(deviceId, desired, undefined, {activeTarget: {timeZone: 'Europe/London'}});
+  await fs.writeFile(descriptorPath, JSON.stringify({...descriptor, capabilities: {activeTargetAlignment: false}}), {mode: 0o600});
+  assert.equal((await client.apply(preview.token)).writeAttempted, false);
+  assert.equal(seen.length, 1);
 });

@@ -3,7 +3,8 @@ import {lstat, open, readdir, realpath, stat} from 'node:fs/promises';
 import {request} from 'node:http';
 import {dirname, join} from 'node:path';
 import {copyProgramme, isRecord, requireProgramme, WeeklyProgramme} from '../programmes';
-import {HeatingZone, ProgrammeProvider, ProviderApplyOptions, ProviderApplyResult, ProviderPrepareOptions, ProviderPreview} from '../controller/Provider';
+import {HeatingZone, matchesFreshProgrammeTarget, ProgrammeProvider, ProviderApplyOptions, ProviderApplyResult, ProviderPrepareOptions, ProviderPreview} from '../controller/Provider';
+import {isThermostatTimeZone} from '../controller/NowNext';
 
 interface Descriptor {
   version: 1;
@@ -13,13 +14,14 @@ interface Descriptor {
   pid: number;
   socketPath: string;
   token: string;
-  capabilities?: {automaticFreshBaseline?: boolean; automaticCancellation?: boolean};
+  capabilities?: {automaticFreshBaseline?: boolean; automaticCancellation?: boolean; activeTargetAlignment?: boolean};
 }
 export interface TuyaIpcTransportOptions {
   storagePath: string;
   instanceId?: string;
 }
-interface PreparedOwner {descriptor: Descriptor; deviceId: string; programme: WeeklyProgramme; expiresAt: number; automatic: boolean}
+interface PreparedOwner {descriptor: Descriptor; deviceId: string; programme: WeeklyProgramme; expiresAt: number; automatic: boolean;
+  activeTarget?: {timeZone: string}}
 
 /** Private device connection. It never reads Tuya credentials or decides household intent. */
 export class TuyaIpcTransport implements ProgrammeProvider {
@@ -65,11 +67,18 @@ export class TuyaIpcTransport implements ProgrammeProvider {
     requireProgramme(Object.values(desired).every(periods => periods.length === 4), 'TUYA_FOUR_PERIODS_REQUIRED');
     requireProgramme(expectedFingerprint === undefined || /^[a-f0-9]{64}$/.test(expectedFingerprint),
       'TUYA_IPC_INVALID_BASELINE');
+    requireProgramme(options.activeTarget === undefined || (isRecord(options.activeTarget)
+      && Object.keys(options.activeTarget).length === 1 && isThermostatTimeZone(options.activeTarget.timeZone)),
+    'TUYA_IPC_INVALID_ACTIVE_TARGET');
+    const activeTarget = options.activeTarget && {timeZone: options.activeTarget.timeZone};
     const descriptor = await this.descriptor();
+    requireProgramme(!activeTarget || descriptor.capabilities?.activeTargetAlignment === true,
+      'TUYA_IPC_ACTIVE_TARGET_ALIGNMENT_REQUIRED');
     const automatic = options.requireScheduled === true && expectedFingerprint === undefined
       && descriptor.capabilities?.automaticFreshBaseline === true;
     const body = await this.call(descriptor, automatic ? '/provider/prepare-automatic' : '/provider/prepare', {deviceId, programme: desired,
       ...(expectedFingerprint === undefined ? {} : {expectedFingerprint}),
+      ...(activeTarget ? {activeTarget} : {}),
       ...(options.requireScheduled === true ? {requireScheduled: true} : {})}, false);
     const preview = body.preview;
     requireProgramme(isRecord(preview) && typeof preview.token === 'string' && /^[a-f0-9-]{36}$/.test(preview.token)
@@ -81,18 +90,22 @@ export class TuyaIpcTransport implements ProgrammeProvider {
     requireProgramme(options.requireScheduled !== true || preview.requireScheduled === true,
       'TUYA_IPC_SCHEDULED_BASELINE_GUARD_REQUIRED');
     requireProgramme(!automatic || preview.automaticFreshBaseline === true, 'TUYA_IPC_OWNED_BASELINE_REQUIRED');
+    requireProgramme(!activeTarget || (isRecord(preview.activeTarget) && Object.keys(preview.activeTarget).length === 1
+      && preview.activeTarget.timeZone === activeTarget.timeZone), 'TUYA_IPC_ACTIVE_TARGET_GUARD_REQUIRED');
     const received = copyProgramme(preview.programme, 4, {minC: 5, maxC: 40, stepC: 0.5});
     requireProgramme(JSON.stringify(received) === JSON.stringify(desired), 'TUYA_IPC_PREVIEW_PROGRAMME_MISMATCH');
     for (const [token, owner] of this.previews) {
       if (owner.expiresAt <= Date.now()) this.previews.delete(token);
     }
     while (this.previews.size >= 64) this.previews.delete(this.previews.keys().next().value!);
-    this.previews.set(preview.token, {descriptor, deviceId, programme: received, expiresAt: preview.expiresAt, automatic});
+    this.previews.set(preview.token, {descriptor, deviceId, programme: received, expiresAt: preview.expiresAt, automatic,
+      ...(activeTarget ? {activeTarget} : {})});
     return {token: preview.token, deviceId, programme: received, expiresAt: preview.expiresAt,
-      changesRequired: preview.changesRequired};
+      changesRequired: preview.changesRequired, ...(activeTarget ? {activeTarget} : {})};
   }
 
   async apply(token: string, options: ProviderApplyOptions = {}): Promise<ProviderApplyResult> {
+    const startedAt = Date.now();
     const owner = this.previews.get(token);
     this.previews.delete(token);
     if (!owner || owner.expiresAt <= Date.now()) {
@@ -107,7 +120,8 @@ export class TuyaIpcTransport implements ProgrammeProvider {
       descriptor = await this.descriptor();
       if (descriptor.instanceId !== owner.descriptor.instanceId || descriptor.pid !== owner.descriptor.pid
         || descriptor.token !== owner.descriptor.token
-        || (owner.automatic && descriptor.capabilities?.automaticFreshBaseline !== true)) throw new Error('runtime changed');
+        || (owner.automatic && descriptor.capabilities?.automaticFreshBaseline !== true)
+        || (owner.activeTarget && descriptor.capabilities?.activeTargetAlignment !== true)) throw new Error('runtime changed');
     } catch {
       return {status: 'not-applied', reason: 'The FastWarm connection changed. Prepare a fresh preview.', writeAttempted: false};
     }
@@ -149,6 +163,9 @@ export class TuyaIpcTransport implements ProgrammeProvider {
       requireProgramme(result.status !== 'confirmed' || Boolean(readback?.online && readback.scheduled && readback.programme
         && JSON.stringify(readback.programme) === JSON.stringify(owner.programme)),
         'TUYA_IPC_CONFIRMATION_MISSING_READBACK');
+      requireProgramme(result.status !== 'confirmed' || !owner.activeTarget || Boolean(readback
+        && matchesFreshProgrammeTarget(readback, owner.programme, owner.activeTarget.timeZone, startedAt)),
+      'TUYA_IPC_CONFIRMATION_MISSING_ACTIVE_TARGET');
       return {status: result.status as ProviderApplyResult['status'], reason: result.reason,
         writeAttempted: result.writeAttempted, ...(readback ? {readback} : {}), ...(result.superseded === true ? {superseded: true} : {})};
     } catch {
@@ -217,6 +234,11 @@ export class TuyaIpcTransport implements ProgrammeProvider {
         && ['single-events', 'whole-days', 'grouped-events', 'grouped-days'].includes(value.programmeWriteMode),
       'TUYA_IPC_INVALID_WRITE_MODE');
       result.programmeWriteMode = value.programmeWriteMode as HeatingZone['programmeWriteMode'];
+    }
+    if (value.targetReadAt !== undefined) {
+      requireProgramme(typeof value.targetReadAt === 'number' && Number.isSafeInteger(value.targetReadAt)
+        && value.targetReadAt >= 0 && value.targetReadAt <= Date.now(), 'TUYA_IPC_INVALID_TARGET_OBSERVATION');
+      result.targetReadAt = value.targetReadAt;
     }
     // Only forward actual accepted observations. A poll never invents a temperature timestamp.
     for (const key of ['temperatureReceivedAt', 'temperatureReportedAt'] as const) {
@@ -294,7 +316,8 @@ export class TuyaIpcTransport implements ProgrammeProvider {
         && value.socketPath === join(runtimePath, `tuya-programmes-${value.instanceId}.sock`)
         && (value.capabilities === undefined || (isRecord(value.capabilities)
           && (value.capabilities.automaticFreshBaseline === undefined || typeof value.capabilities.automaticFreshBaseline === 'boolean')
-          && (value.capabilities.automaticCancellation === undefined || typeof value.capabilities.automaticCancellation === 'boolean'))),
+          && (value.capabilities.automaticCancellation === undefined || typeof value.capabilities.automaticCancellation === 'boolean')
+          && (value.capabilities.activeTargetAlignment === undefined || typeof value.capabilities.activeTargetAlignment === 'boolean'))),
       'TUYA_IPC_INVALID_DESCRIPTOR');
       const descriptor = value as unknown as Descriptor;
       const socket = await lstat(descriptor.socketPath);

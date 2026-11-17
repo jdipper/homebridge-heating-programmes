@@ -3,7 +3,7 @@ import {randomUUID} from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {copyProgramme, isRecord, ProgrammeProfile, programmeFingerprint, WeeklyProgramme} from '../programmes';
-import {HeatingZone, ProgrammeProvider, ProviderPreview} from './Provider';
+import {HeatingZone, matchesFreshProgrammeTarget, ProgrammeProvider, ProviderPreview} from './Provider';
 import {fromEditor, toEditor} from './EditorProgramme';
 import {createThermostatControlPolicy, evaluateThermostatControlPolicy, policyDeadlines, policyIntent,
   policyMinutes, policyTimestamp, restoreThermostatControlPolicy, ThermostatControlPolicy} from './ControlPolicy';
@@ -53,7 +53,7 @@ export class HeatingController extends EventEmitter {
   private running = new Map<string, Promise<void>>();
   private reserved = new Set<string>();
   private pending = new Map<string, ProgrammeProfile>();
-  private automatic = new Map<string, {abort: AbortController; profile: ProgrammeProfile; fingerprint: string}>();
+  private automatic = new Map<string, {abort: AbortController; profile: ProgrammeProfile; fingerprint: string; timeZone?: string}>();
   private plans = new Map<string, Plan>();
   private history = new ThermostatHistory();
   private stateQueue: Promise<void> = Promise.resolve();
@@ -304,6 +304,7 @@ export class HeatingController extends EventEmitter {
           roomName: zone?.roomName, deviceName: zone?.name, customName: room.name,
           nameSource: room.name ? 'custom' : zone?.roomName ? room.provider : 'device',
           online: zone?.online ?? false, currentTemperature: zone?.measuredC ?? undefined, targetTemperature: zone?.targetC ?? undefined,
+          targetReadAt: zone?.targetReadAt,
           mode: zone?.mode, grouping: room.provider === 'tuya' ? 0 : undefined, scheduled: zone?.scheduled ?? false,
           timeZone: room.timeZone, clockVerified: room.clockVerified,
           nowNext: zone?.programme ? getThermostatNowNext(toEditor(zone.programme), room) : undefined,
@@ -353,7 +354,11 @@ export class HeatingController extends EventEmitter {
       case '/rooms/refresh': await this.refresh(true); return this.view();
       case '/rooms/save': {
         const id = this.id(body.deviceId);
-        await this.transaction(() => {Object.assign(this.saved.rooms[id]!, this.settings({...this.saved.rooms[id], ...body}));});
+        await this.transaction(() => {
+          const room = this.saved.rooms[id]!, settings = this.settings({...room, ...body});
+          if (room.provider === 'tuya' && settings.timeZone !== room.timeZone) delete room.confirmation;
+          Object.assign(room, settings);
+        });
         return this.view();
       }
       case '/temperatures/history': {
@@ -396,6 +401,7 @@ export class HeatingController extends EventEmitter {
         for (const id of ids) this.launch(id, key ? 'verifying' : 'reading', async () => {
           const room = this.saved.rooms[id]!;
           const expected = key ? room.profiles[key] : undefined;
+          const timeZone = room.timeZone, startedAt = Date.now();
           const observed = await this.provider(id).read(room.deviceId);
           await this.transaction(() => {
             this.observe(id, observed);
@@ -404,6 +410,10 @@ export class HeatingController extends EventEmitter {
               if (!observed.online || !observed.scheduled || !observed.programme || !expected
                 || programmeFingerprint(observed.programme) !== programmeFingerprint(expected)
                 || !current.profiles[key] || programmeFingerprint(current.profiles[key]!) !== programmeFingerprint(expected)) throw new Error('The complete stored programme or Scheduled mode does not match. No changes were sent.');
+              if (room.provider === 'tuya' && (current.timeZone !== timeZone
+                || !matchesFreshProgrammeTarget(observed, expected, timeZone, startedAt))) {
+                throw new Error('The current target temperature does not freshly match the active programme period. No changes were sent.');
+              }
               current.confirmation = {profile: key, programme: expected, at: Date.now()}; delete current.failure; delete current.failureProfile;
             }
           });
@@ -420,6 +430,10 @@ export class HeatingController extends EventEmitter {
           this.busy(item.id);
           const current = this.saved.rooms[item.id]!.profiles[item.profile];
           if (!current || programmeFingerprint(current) !== programmeFingerprint(item.preview.programme)) throw new Error('A draft changed after preview. Review again.');
+          const room = this.saved.rooms[item.id]!;
+          if (room.provider === 'tuya' && item.preview.activeTarget?.timeZone !== room.timeZone) {
+            throw new Error('The room time zone changed after preview. Review again.');
+          }
         }
         this.plans.delete(plan.id);
         for (const item of plan.devices) this.launchApply(item.id, item.profile, item.preview);
@@ -462,7 +476,8 @@ export class HeatingController extends EventEmitter {
           const programme = room.profiles[key];
           if (!programme) throw new Error('Save the selected profile for every selected room first.');
           if (!zone?.online || !zone.writeEnabled || !zone.fingerprint) throw new Error('Read a complete current programme and enable uploads before applying.');
-          const prepared = await this.provider(id).prepare(room.deviceId, this.validate(id, programme), zone.fingerprint);
+          const prepared = await this.provider(id).prepare(room.deviceId, this.validate(id, programme), zone.fingerprint,
+            room.provider === 'tuya' ? {activeTarget: {timeZone: room.timeZone}} : undefined);
           const changes = Object.keys(programme).reduce((count, day) => {
             const desired = programme[day as keyof WeeklyProgramme], previous = zone.programme?.[day as keyof WeeklyProgramme] ?? [];
             return count + Array.from({length: Math.max(desired.length, previous.length)}, (_, slot) =>
@@ -517,6 +532,7 @@ export class HeatingController extends EventEmitter {
       const room = this.saved.rooms[id];
       if (!room?.enabled) operation.abort.abort('disabled');
       else if (room.requestedProfile !== operation.profile) operation.abort.abort('intent-changed');
+      else if (operation.timeZone !== undefined && room.timeZone !== operation.timeZone) operation.abort.abort('time-zone-changed');
       else if (!room.profiles[operation.profile]
         || programmeFingerprint(room.profiles[operation.profile]!) !== operation.fingerprint) operation.abort.abort('draft-changed');
     }
@@ -527,6 +543,7 @@ export class HeatingController extends EventEmitter {
     const desiredAtStart = this.saved.rooms[id]!.profiles[key];
     const automatic = preview || !desiredAtStart ? undefined : {
       abort: new AbortController(), profile: key, fingerprint: programmeFingerprint(desiredAtStart),
+      timeZone: this.saved.rooms[id]!.provider === 'tuya' ? this.saved.rooms[id]!.timeZone : undefined,
     };
     if (automatic) this.automatic.set(id, automatic);
     const operationId = randomUUID();
@@ -553,11 +570,15 @@ export class HeatingController extends EventEmitter {
           }
           // The provider owns a fresh native baseline and enforces Scheduled mode
           // before upload. The controller still checks the saved draft before apply.
-          prepared = await provider.prepare(room.deviceId, this.validate(id, desired), undefined, {requireScheduled: true});
+          prepared = await provider.prepare(room.deviceId, this.validate(id, desired), undefined, {requireScheduled: true,
+            ...(room.provider === 'tuya' ? {activeTarget: {timeZone: automatic!.timeZone!}} : {})});
         }
         const currentDraft = this.saved.rooms[id]!.profiles[key];
         if (!currentDraft || programmeFingerprint(prepared.programme) !== programmeFingerprint(currentDraft)
           || programmeFingerprint(prepared.programme) !== programmeFingerprint(desired)) throw new Error('The saved programme changed during preparation.');
+        if (room.provider === 'tuya' && prepared.activeTarget?.timeZone !== this.saved.rooms[id]!.timeZone) {
+          throw new Error('The room time zone changed during preparation. Review again.');
+        }
         if (!preview && (obsolete() || !this.saved.rooms[id]!.enabled || this.saved.rooms[id]!.requestedProfile !== key)) {
           await finishObsolete(); return;
         }
@@ -567,6 +588,7 @@ export class HeatingController extends EventEmitter {
         if (obsolete()) {await finishObsolete(); return;}
         if (this.closed || prepared.expiresAt <= Date.now()) throw new Error('Programme application stopped before upload.');
         dispatched = true;
+        const applyStartedAt = Date.now();
         const result = await provider.apply(prepared.token, automatic ? {signal: automatic.abort.signal} : undefined);
         if (result.readback) await this.transaction(() => {this.observe(id, result.readback!);});
         if (obsolete() && ((result.status === 'not-applied' && !result.writeAttempted)
@@ -576,6 +598,10 @@ export class HeatingController extends EventEmitter {
         if (result.status !== 'confirmed' || !result.readback?.online || !result.readback.scheduled || !result.readback.programme
           || programmeFingerprint(result.readback.programme) !== programmeFingerprint(desired)) {
           throw new Error(`${result.reason} Do not automatically retry; read and verify this thermostat.`);
+        }
+        if (room.provider === 'tuya' && (prepared.activeTarget?.timeZone !== this.saved.rooms[id]!.timeZone
+          || !matchesFreshProgrammeTarget(result.readback, desired, prepared.activeTarget.timeZone, applyStartedAt))) {
+          throw new Error('The current target temperature does not freshly match the active programme period. Do not automatically retry; read and verify this thermostat.');
         }
         if (obsolete()) {await finishObsolete(); return;}
         let confirmed = false;
