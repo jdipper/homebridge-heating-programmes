@@ -83,6 +83,18 @@ test('private provider operations and overrides are not exposed through the edit
   assert.equal(f.calls.length, 0);
 });
 
+test('the editor proxy distinguishes explicit Home from raw occupancy and refuses the removed Away-delay settings', async t => {
+  const f = await fixture(t);
+  await requestRuntime(f.descriptor, '/home', { home: true });
+  await requestRuntime(f.descriptor, '/presence', { home: false });
+  await requestRuntime(f.descriptor, '/holiday', { active: false });
+  await assert.rejects(requestRuntime(f.descriptor, '/controls/settings', { awayDelayMinutes: 30 }), /supported heating operation/);
+  assert.deepEqual(f.calls.map(call => ({ route: call.route, body: call.body })), [
+    { route: '/home', body: { home: true } }, { route: '/presence', body: { home: false } },
+    { route: '/holiday', body: { active: false } },
+  ]);
+});
+
 test('editor proxy rejects a different runtime identity instead of showing its data', async t => {
   const f = await fixture(t);
   f.setReply((request, response) => { response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ instanceId: 'fedcba9876543210', thermostats: [] })); });

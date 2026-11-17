@@ -35,7 +35,7 @@ async function fixture(t, options = {}) {
   const server = http.createServer((req, res) => {
     let encoded = '';
     req.on('data', chunk => { encoded += chunk; });
-    req.on('end', () => {
+    req.on('end', async () => {
       const body = JSON.parse(encoded);
       seen.push({route: req.url, method: req.method, body});
       assert.equal(req.headers.authorization, `Bearer ${token}`);
@@ -50,13 +50,16 @@ async function fixture(t, options = {}) {
         ...(req.url === '/provider/prepare-automatic' ? {automaticFreshBaseline: true} : {}),
       }};
       else if (req.url === '/provider/discard') payload = {discarded: true};
+      else if (req.url === '/provider/cancel-automatic') payload = {cancelled: true};
       else if (req.url === '/provider/apply' || req.url === '/provider/apply-automatic') payload = {
         ...(req.url === '/provider/apply-automatic' ? {automaticFreshBaseline: true} : {}), result: {
         status: 'confirmed', reason: 'Full week and Scheduled mode confirmed.', writeAttempted: true,
         readback: {...zone, programme: desired, fingerprint: 'd'.repeat(64), readAt: Date.now()},
       }};
       const replacement = options.reply?.({route: req.url, body, payload, zone});
-      res.writeHead(options.status ?? 200, {'content-type': options.contentType ?? 'application/json'});
+      await options.beforeReply?.({route: req.url, body});
+      res.writeHead(typeof options.status === 'function' ? options.status(req.url) : options.status ?? 200,
+        {'content-type': options.contentType ?? 'application/json'});
       const response = {protocolVersion: 1, instanceId, ...payload, ...replacement};
       res.end(options.rawReply ?? JSON.stringify(response));
     });
@@ -83,6 +86,110 @@ test('device connection lists and reads the real shape over authenticated privat
     {route: '/provider/list', method: 'POST', body: {}},
     {route: '/provider/read', method: 'POST', body: {deviceId}},
   ]);
+});
+
+test('a pre-aborted automatic apply consumes its preview and releases the owned lease without an apply request', async t => {
+  const {client, seen} = await fixture(t, {descriptor: {capabilities: {automaticFreshBaseline: true, automaticCancellation: true}}});
+  const preview = await client.prepare(deviceId, desired, undefined, {requireScheduled: true});
+  const abort = new AbortController(); abort.abort();
+  assert.deepEqual(await client.apply(preview.token, {signal: abort.signal}), {
+    status: 'not-applied', reason: 'The automatic selection was superseded before dispatch.', writeAttempted: false,
+  });
+  assert.deepEqual(seen.map(call => call.route), ['/provider/prepare-automatic', '/provider/discard']);
+  assert.equal((await client.apply(preview.token)).writeAttempted, false);
+});
+
+test('superseding an in-flight capable apply sends one local cancellation while its result remains serialized', async t => {
+  let enterApply, finishApply, enterCancel;
+  const entered = new Promise(resolve => {enterApply = resolve;});
+  const gate = new Promise(resolve => {finishApply = resolve;});
+  const cancelled = new Promise(resolve => {enterCancel = resolve;});
+  const {client, seen} = await fixture(t, {descriptor: {capabilities: {automaticFreshBaseline: true, automaticCancellation: true}},
+    beforeReply: async ({route}) => {
+      if (route === '/provider/apply-automatic') {enterApply(); await gate;}
+      if (route === '/provider/cancel-automatic') enterCancel();
+    }, reply: ({route, payload}) => route === '/provider/apply-automatic'
+      ? {result: {...payload.result, status: 'unconfirmed', reason: 'Remaining commands cancelled.', superseded: true}} : {}});
+  const preview = await client.prepare(deviceId, desired, undefined, {requireScheduled: true});
+  const abort = new AbortController(); let completed = false;
+  const apply = client.apply(preview.token, {signal: abort.signal}).then(result => {completed = true; return result;});
+  await entered; abort.abort(); await cancelled;
+  assert.equal(completed, false, 'cancellation does not release the original operation before its submitted request finishes');
+  finishApply(); const result = await apply;
+  assert.equal(result.status, 'unconfirmed'); assert.equal(result.writeAttempted, true);
+  assert.equal(result.superseded, true);
+  assert.deepEqual(seen.map(call => call.route), ['/provider/prepare-automatic', '/provider/apply-automatic', '/provider/cancel-automatic']);
+  assert.deepEqual(seen.at(-1).body, {token: preview.token});
+  abort.abort(); await new Promise(resolve => setImmediate(resolve)); assert.equal(seen.length, 3);
+});
+
+for (const [name, options] of [
+  ['an un-aborted selection', {capability: true, status: 'unconfirmed'}],
+  ['an unknown write', {capability: true, status: 'unknown', abort: true}],
+  ['an older provider', {capability: false, status: 'unconfirmed', abort: true}],
+]) test(`supersession proof cannot be forged for ${name}`, async t => {
+  let enterApply, finishApply;
+  const entered = new Promise(resolve => {enterApply = resolve;});
+  const gate = new Promise(resolve => {finishApply = resolve;});
+  const {client} = await fixture(t, {descriptor: {capabilities: {automaticFreshBaseline: true, automaticCancellation: options.capability}},
+    beforeReply: async ({route}) => {if (route === '/provider/apply-automatic') {enterApply(); await gate;}},
+    reply: ({route, payload}) => route === '/provider/apply-automatic'
+      ? {result: {...payload.result, status: options.status, superseded: true}} : {}});
+  const preview = await client.prepare(deviceId, desired, undefined, {requireScheduled: true});
+  const abort = new AbortController(), applying = client.apply(preview.token, {signal: abort.signal});
+  await entered; if (options.abort) abort.abort(); finishApply();
+  const result = await applying;
+  assert.equal(result.status, 'unknown'); assert.equal(result.superseded, undefined);
+});
+
+test('an older automatic provider finishes its submitted apply without guessing an unsupported cancellation route', async t => {
+  let enterApply, finishApply;
+  const entered = new Promise(resolve => {enterApply = resolve;});
+  const gate = new Promise(resolve => {finishApply = resolve;});
+  const {client, seen} = await fixture(t, {descriptor: {capabilities: {automaticFreshBaseline: true}},
+    beforeReply: async ({route}) => {if (route === '/provider/apply-automatic') {enterApply(); await gate;}}});
+  const preview = await client.prepare(deviceId, desired, undefined, {requireScheduled: true});
+  const abort = new AbortController(), apply = client.apply(preview.token, {signal: abort.signal});
+  await entered; abort.abort(); finishApply();
+  assert.equal((await apply).status, 'confirmed');
+  assert.deepEqual(seen.map(call => call.route), ['/provider/prepare-automatic', '/provider/apply-automatic']);
+});
+
+for (const [name, acknowledgement, knownNotApplied] of [
+  ['an irreversible pre-claim cancellation', {cancelled: true, notApplied: true}, true],
+  ['an already claimed cancellation', {cancelled: true, notApplied: false}, false],
+  ['an older cancellation acknowledgement', {cancelled: true}, false],
+  ['a contradictory acknowledgement', {cancelled: false, notApplied: true}, false],
+  ['a failed cancellation request', {cancelled: true, notApplied: true, failed: true}, false],
+]) test(`a cancellation overtaking apply uses proof only for ${name}`, async t => {
+  let enterApply, releaseApply, prevented = false, nativeWrites = 0;
+  const entered = new Promise(resolve => {enterApply = resolve;});
+  const gate = new Promise(resolve => {releaseApply = resolve;});
+  const {client, seen} = await fixture(t, {descriptor: {capabilities: {automaticFreshBaseline: true, automaticCancellation: true}},
+    status: route => route === '/provider/apply-automatic' ? 400
+      : route === '/provider/cancel-automatic' && acknowledgement.failed ? 503 : 200,
+    reply: ({route}) => {
+      if (route === '/provider/cancel-automatic') {prevented = true; return acknowledgement;}
+      if (route === '/provider/apply-automatic' && !prevented) nativeWrites++;
+      return {};
+    }});
+  // Separate IPC connections need not reach the provider in their creation
+  // order. Hold transmission of apply until the cancellation reply arrives.
+  const call = client.call.bind(client);
+  client.call = async (descriptor, route, payload, writing) => {
+    if (route === '/provider/apply-automatic') {enterApply(); await gate;}
+    try {return await call(descriptor, route, payload, writing);}
+    finally {if (route === '/provider/cancel-automatic') releaseApply();}
+  };
+  const preview = await client.prepare(deviceId, desired, undefined, {requireScheduled: true});
+  const abort = new AbortController(), applying = client.apply(preview.token, {signal: abort.signal});
+  await entered; abort.abort(); const result = await applying;
+  assert.equal(result.status, knownNotApplied ? 'not-applied' : 'unknown');
+  assert.equal(result.writeAttempted, !knownNotApplied);
+  assert.equal(result.superseded, knownNotApplied ? true : undefined);
+  assert.equal(nativeWrites, 0);
+  assert.deepEqual(seen.map(call => call.route), ['/provider/prepare-automatic', '/provider/cancel-automatic', '/provider/apply-automatic']);
+  assert.equal((await client.apply(preview.token)).writeAttempted, false, 'the original token remains consumed');
 });
 
 test('automatic preparation requires explicit Scheduled-baseline proof from the provider', async t => {
@@ -332,9 +439,11 @@ for (const [name, options] of [
 
 
 test('capable automatic preparation and application use one queue-owned native baseline with explicit response proof', async t => {
-  const {client, seen} = await fixture(t, {descriptor: {capabilities: {automaticFreshBaseline: true}}});
+  const {client, seen} = await fixture(t, {descriptor: {capabilities: {automaticFreshBaseline: true, automaticCancellation: true}}});
   const preview = await client.prepare(deviceId, desired, undefined, {requireScheduled: true});
-  const result = await client.apply(preview.token);
+  const abort = new AbortController();
+  const result = await client.apply(preview.token, {signal: abort.signal});
+  abort.abort(); await new Promise(resolve => setImmediate(resolve));
   assert.equal(result.status, 'confirmed');
   assert.deepEqual(seen.map(call => call.route), ['/provider/prepare-automatic', '/provider/apply-automatic']);
   assert.deepEqual(seen[0].body, {deviceId, programme: desired, requireScheduled: true});

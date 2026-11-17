@@ -3,7 +3,7 @@ import {lstat, open, readdir, realpath, stat} from 'node:fs/promises';
 import {request} from 'node:http';
 import {dirname, join} from 'node:path';
 import {copyProgramme, isRecord, requireProgramme, WeeklyProgramme} from '../programmes';
-import {HeatingZone, ProgrammeProvider, ProviderApplyResult, ProviderPrepareOptions, ProviderPreview} from '../controller/Provider';
+import {HeatingZone, ProgrammeProvider, ProviderApplyOptions, ProviderApplyResult, ProviderPrepareOptions, ProviderPreview} from '../controller/Provider';
 
 interface Descriptor {
   version: 1;
@@ -13,7 +13,7 @@ interface Descriptor {
   pid: number;
   socketPath: string;
   token: string;
-  capabilities?: {automaticFreshBaseline?: boolean};
+  capabilities?: {automaticFreshBaseline?: boolean; automaticCancellation?: boolean};
 }
 export interface TuyaIpcTransportOptions {
   storagePath: string;
@@ -92,11 +92,15 @@ export class TuyaIpcTransport implements ProgrammeProvider {
       changesRequired: preview.changesRequired};
   }
 
-  async apply(token: string): Promise<ProviderApplyResult> {
+  async apply(token: string, options: ProviderApplyOptions = {}): Promise<ProviderApplyResult> {
     const owner = this.previews.get(token);
     this.previews.delete(token);
     if (!owner || owner.expiresAt <= Date.now()) {
       return {status: 'not-applied', reason: 'The FastWarm preview expired or was already used. Prepare it again.', writeAttempted: false};
+    }
+    if (options.signal?.aborted) {
+      await this.discardOwner(token, owner).catch(() => undefined);
+      return {status: 'not-applied', reason: 'The automatic selection was superseded before dispatch.', writeAttempted: false};
     }
     let descriptor: Descriptor;
     try {
@@ -107,6 +111,27 @@ export class TuyaIpcTransport implements ProgrammeProvider {
     } catch {
       return {status: 'not-applied', reason: 'The FastWarm connection changed. Prepare a fresh preview.', writeAttempted: false};
     }
+    if (options.signal?.aborted) {
+      await this.discardOwner(token, owner).catch(() => undefined);
+      return {status: 'not-applied', reason: 'The automatic selection was superseded before dispatch.', writeAttempted: false};
+    }
+    let cancellation: Promise<void> | undefined;
+    let cancellationProvedNotApplied = false;
+    const cancel = () => {
+      // Older providers finish their already-submitted apply before the
+      // controller prepares the latest selection. Never guess a cancel route.
+      if (!cancellation && owner.automatic && descriptor.capabilities?.automaticCancellation === true) {
+        cancellation = this.call(descriptor, '/provider/cancel-automatic', {token}, false)
+          .then(body => {
+            requireProgramme(typeof body.cancelled === 'boolean'
+              && (body.notApplied === undefined || typeof body.notApplied === 'boolean')
+              && (body.notApplied !== true || body.cancelled === true), 'TUYA_IPC_INVALID_CANCELLATION');
+            cancellationProvedNotApplied = body.cancelled === true && body.notApplied === true;
+          })
+          .catch(() => undefined);
+      }
+    };
+    options.signal?.addEventListener('abort', cancel, {once: true});
     try {
       const body = await this.call(descriptor, owner.automatic ? '/provider/apply-automatic' : '/provider/apply', {token}, true);
       requireProgramme(!owner.automatic || body.automaticFreshBaseline === true, 'TUYA_IPC_OWNED_BASELINE_REQUIRED');
@@ -115,20 +140,39 @@ export class TuyaIpcTransport implements ProgrammeProvider {
         && ['confirmed', 'conflict', 'not-applied', 'unconfirmed', 'unknown'].includes(result.status)
         && typeof result.reason === 'string' && result.reason.length <= 4096 && typeof result.writeAttempted === 'boolean',
       'TUYA_IPC_INVALID_APPLY_RESULT');
+      requireProgramme(result.superseded === undefined || typeof result.superseded === 'boolean', 'TUYA_IPC_INVALID_SUPERSESSION');
+      requireProgramme(result.superseded !== true || Boolean(owner.automatic && options.signal?.aborted
+        && descriptor.capabilities?.automaticCancellation === true && result.status !== 'unknown' && result.status !== 'confirmed'),
+      'TUYA_IPC_INVALID_SUPERSESSION');
       const readback = result.readback === undefined ? undefined : this.zone(result.readback);
       requireProgramme(!readback || readback.id === owner.deviceId, 'TUYA_IPC_ZONE_ID_MISMATCH');
       requireProgramme(result.status !== 'confirmed' || Boolean(readback?.online && readback.scheduled && readback.programme
         && JSON.stringify(readback.programme) === JSON.stringify(owner.programme)),
         'TUYA_IPC_CONFIRMATION_MISSING_READBACK');
       return {status: result.status as ProviderApplyResult['status'], reason: result.reason,
-        writeAttempted: result.writeAttempted, ...(readback ? {readback} : {})};
+        writeAttempted: result.writeAttempted, ...(readback ? {readback} : {}), ...(result.superseded === true ? {superseded: true} : {})};
     } catch {
+      // A cancellation RPC can overtake apply on another socket connection.
+      // Only the provider's irreversible pre-claim cancellation proves no write;
+      // cancelling an already claimed operation never provides this guarantee.
+      await cancellation;
+      if (cancellationProvedNotApplied && options.signal?.aborted) {
+        return {status: 'not-applied', reason: 'The automatic selection was superseded before the provider claimed it.',
+          writeAttempted: false, superseded: true};
+      }
       return {status: 'unknown', reason: 'The FastWarm result could not be confirmed. Do not automatically retry.', writeAttempted: true};
+    } finally {
+      options.signal?.removeEventListener('abort', cancel);
+      await cancellation;
     }
   }
 
   async discard(token: string): Promise<void> {
     const owner = this.previews.get(token); this.previews.delete(token);
+    if (owner) await this.discardOwner(token, owner);
+  }
+
+  private async discardOwner(token: string, owner: PreparedOwner): Promise<void> {
     if (!owner?.automatic) return;
     const descriptor = await this.descriptor();
     if (descriptor.instanceId !== owner.descriptor.instanceId || descriptor.pid !== owner.descriptor.pid
@@ -249,7 +293,8 @@ export class TuyaIpcTransport implements ProgrammeProvider {
         && typeof value.token === 'string' && /^[a-f0-9]{64}$/.test(value.token)
         && value.socketPath === join(runtimePath, `tuya-programmes-${value.instanceId}.sock`)
         && (value.capabilities === undefined || (isRecord(value.capabilities)
-          && (value.capabilities.automaticFreshBaseline === undefined || typeof value.capabilities.automaticFreshBaseline === 'boolean'))),
+          && (value.capabilities.automaticFreshBaseline === undefined || typeof value.capabilities.automaticFreshBaseline === 'boolean')
+          && (value.capabilities.automaticCancellation === undefined || typeof value.capabilities.automaticCancellation === 'boolean'))),
       'TUYA_IPC_INVALID_DESCRIPTOR');
       const descriptor = value as unknown as Descriptor;
       const socket = await lstat(descriptor.socketPath);

@@ -1,5 +1,5 @@
 import {copyProgramme, TargetLimits, WeeklyProgramme} from '../programmes';
-import {HeatingZone, ProgrammeProvider, ProviderApplyResult, ProviderPrepareOptions, ProviderPreview} from '../controller/Provider';
+import {HeatingZone, ProgrammeProvider, ProviderApplyOptions, ProviderApplyResult, ProviderPrepareOptions, ProviderPreview} from '../controller/Provider';
 import {HiveProgrammeAdapter, HiveZoneSnapshot} from './HiveProgrammeAdapter';
 import {HiveIpcTransport} from './HiveIpcTransport';
 
@@ -35,9 +35,10 @@ export class HiveProvider implements ProgrammeProvider {
     return {token: preview.token, deviceId, programme: preview.programme,
       expiresAt: preview.expiresAt, changesRequired: preview.changesRequired};
   }
-  async apply(token: string): Promise<ProviderApplyResult> {
-    const result = await this.adapter.apply(token);
+  async apply(token: string, options: ProviderApplyOptions = {}): Promise<ProviderApplyResult> {
+    const result = await this.adapter.apply(token, options);
     return {status: result.status, reason: result.reason, writeAttempted: result.writeAttempted,
       ...(result.readback ? {readback: await this.zone(result.readback)} : {})};
   }
+  async discard(token: string): Promise<void> {this.adapter.discard(token);}
 }

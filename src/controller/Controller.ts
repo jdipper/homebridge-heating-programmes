@@ -22,6 +22,8 @@ interface Room {
   confirmation?: {profile: ProgrammeProfile; programme: WeeklyProgramme; at: number};
   inFlight?: {profile: ProgrammeProfile; operationId: string};
   failure?: string;
+  /** A failed identical automatic selection is never replayed; later different intent may prepare afresh. */
+  failureProfile?: ProgrammeProfile | null;
 }
 interface SavedState {
   version: 1; controls: ThermostatControlPolicy; rooms: Record<string, Room>;
@@ -51,6 +53,7 @@ export class HeatingController extends EventEmitter {
   private running = new Map<string, Promise<void>>();
   private reserved = new Set<string>();
   private pending = new Map<string, ProgrammeProfile>();
+  private automatic = new Map<string, {abort: AbortController; profile: ProgrammeProfile; fingerprint: string}>();
   private plans = new Map<string, Plan>();
   private history = new ThermostatHistory();
   private stateQueue: Promise<void> = Promise.resolve();
@@ -71,6 +74,7 @@ export class HeatingController extends EventEmitter {
     this.server = new RuntimeServer(persistPath, this.instanceId, this.handle);
   }
   get householdPresence() {return this.saved.controls.actualHome;}
+  get homeActive() {return this.saved.controls.holidayActive ? false : this.saved.controls.actualHome;}
   get holidayActive() {return this.saved.controls.holidayActive;}
 
   async start(options: {publishServer?: boolean; poll?: boolean; migrate?: boolean} = {}): Promise<void> {
@@ -170,8 +174,17 @@ export class HeatingController extends EventEmitter {
       if (source.enabled && profiles.some(key => !programmes[key])) throw new Error('An enabled heating room needs all three saved programmes.');
       rooms[id] = {provider: source.provider as Room['provider'], deviceId: source.deviceId, ...this.settings(source),
         profiles: programmes, enabled: source.enabled, requestedProfile: source.enabled ? intent(controls) : null};
-      if (source.inFlight) rooms[id]!.failure = 'A programme operation was interrupted. Read and verify before applying again.';
-      else if (typeof source.failure === 'string') rooms[id]!.failure = source.failure;
+      if (source.inFlight) {
+        rooms[id]!.failure = 'A programme operation was interrupted. Read and verify before applying again.';
+        if (isRecord(source.inFlight) && profiles.includes(source.inFlight.profile as ProgrammeProfile)) {
+          rooms[id]!.failureProfile = source.inFlight.profile as ProgrammeProfile;
+        }
+      } else if (typeof source.failure === 'string') {
+        rooms[id]!.failure = source.failure;
+        if (source.failureProfile === null || profiles.includes(source.failureProfile as ProgrammeProfile)) {
+          rooms[id]!.failureProfile = source.failureProfile as ProgrammeProfile | null;
+        }
+      }
       // Old confirmations are deliberately not restored as current hardware evidence.
     }
     if (value.observationIds !== undefined && (!Array.isArray(value.observationIds) || value.observationIds.length > 4096
@@ -310,8 +323,7 @@ export class HeatingController extends EventEmitter {
         };
       }),
       presence: {home: this.saved.controls.actualHome, effectiveHome: this.saved.controls.effectiveHome,
-        pendingAwayAt: this.saved.controls.pendingAwayAt, holdUntil: this.saved.controls.holdUntil,
-        awayDelayMinutes: this.saved.controls.awayDelayMinutes},
+        holdUntil: this.saved.controls.holdUntil},
       holiday: {active: this.saved.controls.holidayActive, returnAt: this.saved.controls.returnAt,
         preheatMinutes: this.saved.controls.preheatMinutes, preheating: this.saved.controls.preheating,
         recoveryRequired: this.saved.controls.recoveryRequired},
@@ -371,7 +383,7 @@ export class HeatingController extends EventEmitter {
           this.history.recordProgramme(id, {source: 'draft', profile: key, programme: toEditor(programme)});
           room.profiles = next; room.enabled = enabled; room.requestedProfile = enabled ? intent(this.saved.controls) : null;
           if (room.confirmation?.profile === key && programmeFingerprint(room.confirmation.programme) !== programmeFingerprint(programme)) delete room.confirmation;
-          delete room.failure;
+          delete room.failure; delete room.failureProfile;
           this.plans.clear();
         });
         if (!this.running.has(id)) this.jobs.delete(id);
@@ -392,7 +404,7 @@ export class HeatingController extends EventEmitter {
               if (!observed.online || !observed.scheduled || !observed.programme || !expected
                 || programmeFingerprint(observed.programme) !== programmeFingerprint(expected)
                 || !current.profiles[key] || programmeFingerprint(current.profiles[key]!) !== programmeFingerprint(expected)) throw new Error('The complete stored programme or Scheduled mode does not match. No changes were sent.');
-              current.confirmation = {profile: key, programme: expected, at: Date.now()}; delete current.failure;
+              current.confirmation = {profile: key, programme: expected, at: Date.now()}; delete current.failure; delete current.failureProfile;
             }
           });
           this.jobs.set(id, {status: observed.programme ? 'verified' : 'partial'});
@@ -413,32 +425,28 @@ export class HeatingController extends EventEmitter {
         for (const item of plan.devices) this.launchApply(item.id, item.profile, item.preview);
         return this.view();
       }
-      case '/controls/settings': return this.setPolicy(policy => ({...policy,
-        awayDelayMinutes: policyMinutes(body.awayDelayMinutes, 'Away delay', 1440),
-        pendingAwayAt: policy.pendingAwayAt === null ? null : policy.pendingAwayAt
-          + (policyMinutes(body.awayDelayMinutes, 'Away delay', 1440) - policy.awayDelayMinutes) * 60000}));
       case '/presence/hold': return this.setPolicy(policy => ({...policy, holdUntil: policyTimestamp(body.until, 'Keep Home until', Date.now())}));
       case '/controls/recover':
         if (body.confirm !== true) throw new Error('Review and explicitly confirm recovery.');
         return this.setPolicy(policy => ({...policy, recoveryRequired: null}));
-      case '/presence':
+      case '/home': case '/presence':
         if (typeof body.home !== 'boolean') throw new Error('Presence must indicate whether anyone is home.');
         return this.setPolicy(policy => ({...policy, actualHome: body.home as boolean,
-          effectiveHome: body.home ? true : policy.effectiveHome,
-          pendingAwayAt: body.home || policy.awayDelayMinutes === 0 ? null
-            : policy.actualHome === false ? policy.pendingAwayAt : Date.now() + policy.awayDelayMinutes * 60000}));
+          effectiveHome: body.home as boolean,
+          ...(route === '/home' && body.home ? {holidayActive: false, returnAt: null, preheatMinutes: 0, preheating: false} : {})}), true);
       case '/holiday':
         if (typeof body.active !== 'boolean') throw new Error('Holiday must be on or off.');
         return this.setPolicy(policy => {
           const active = body.active as boolean;
-          if (!active && policy.holidayActive && policy.actualHome === null && policy.holdUntil === null
+          if (!active && policy.holidayActive && policy.actualHome === null
+            && (policy.holdUntil === null || policy.holdUntil <= Date.now())
             && Object.values(this.saved.rooms).some(room => room.enabled)) throw new Error('Set household presence before ending Holiday.');
           const returnAt = active && body.returnAt !== undefined ? policyTimestamp(body.returnAt, 'Holiday return', Date.now())
             : active ? policy.returnAt : null;
           const preheatMinutes = body.preheatMinutes === undefined ? policy.preheatMinutes : policyMinutes(body.preheatMinutes, 'Preheat lead', 1440);
           if (active && returnAt !== null && returnAt - preheatMinutes * 60000 <= Date.now() && preheatMinutes > 0) throw new Error('Choose a return after the preheat period.');
           return {...policy, holidayActive: active, returnAt, preheatMinutes, preheating: false};
-        });
+        }, true);
       default: throw new Error('Unsupported heating operation.');
     }
   };
@@ -481,7 +489,7 @@ export class HeatingController extends EventEmitter {
     }
   }
 
-  private async setPolicy(change: (policy: ThermostatControlPolicy) => ThermostatControlPolicy): Promise<unknown> {
+  private async setPolicy(change: (policy: ThermostatControlPolicy) => ThermostatControlPolicy, explicitSelection = false): Promise<unknown> {
     const changed: {id: string; key: ProgrammeProfile}[] = [];
     await this.transaction(() => {
       const controls = evaluateThermostatControlPolicy(change(this.saved.controls), Date.now());
@@ -490,7 +498,8 @@ export class HeatingController extends EventEmitter {
       const key = intent(controls);
       for (const [id, room] of Object.entries(this.saved.rooms)) {
         const next = room.enabled ? key : null;
-        if (next && room.requestedProfile !== next) changed.push({id, key: next});
+        if (next && (room.requestedProfile !== next || (explicitSelection && room.failure
+          && room.failureProfile !== undefined && room.failureProfile !== next))) changed.push({id, key: next});
         room.requestedProfile = next;
       }
     });
@@ -502,7 +511,25 @@ export class HeatingController extends EventEmitter {
     return this.view();
   }
 
+  private cancelObsoleteAutomatic(): void {
+    for (const [id, operation] of this.automatic) {
+      if (operation.abort.signal.aborted) continue;
+      const room = this.saved.rooms[id];
+      if (!room?.enabled) operation.abort.abort('disabled');
+      else if (room.requestedProfile !== operation.profile) operation.abort.abort('intent-changed');
+      else if (!room.profiles[operation.profile]
+        || programmeFingerprint(room.profiles[operation.profile]!) !== operation.fingerprint) operation.abort.abort('draft-changed');
+    }
+  }
+
   private launchApply(id: string, key: ProgrammeProfile, preview?: ProviderPreview): void {
+    this.busy(id);
+    const desiredAtStart = this.saved.rooms[id]!.profiles[key];
+    const automatic = preview || !desiredAtStart ? undefined : {
+      abort: new AbortController(), profile: key, fingerprint: programmeFingerprint(desiredAtStart),
+    };
+    if (automatic) this.automatic.set(id, automatic);
+    const operationId = randomUUID();
     this.launch(id, 'applying', async () => {
       const room = this.saved.rooms[id]!;
       const desired = room.profiles[key];
@@ -510,36 +537,61 @@ export class HeatingController extends EventEmitter {
       const provider = this.provider(id);
       let prepared = preview;
       let dispatched = false;
+      const obsolete = () => Boolean(automatic?.abort.signal.aborted);
+      const finishObsolete = async () => {
+        await this.transaction(() => {const current = this.saved.rooms[id]!;
+          if (current.inFlight?.operationId === operationId) delete current.inFlight;
+          // An old successful request cannot confirm the latest household intent.
+          delete current.confirmation;
+        });
+        this.jobs.set(id, {status: 'pending', requestedProfile: key});
+      };
       try {
         if (!prepared) {
-          if (room.failure) throw new Error('A previous programme operation needs review. Verify the thermostat before applying again.');
+          if (room.failure && (room.failureProfile === undefined || room.failureProfile === key)) {
+            throw new Error('A previous identical programme operation needs review. Verify the thermostat before applying again.');
+          }
           // The provider owns a fresh native baseline and enforces Scheduled mode
           // before upload. The controller still checks the saved draft before apply.
           prepared = await provider.prepare(room.deviceId, this.validate(id, desired), undefined, {requireScheduled: true});
         }
-        if (!preview && (!this.saved.rooms[id]!.enabled || this.saved.rooms[id]!.requestedProfile !== key)) {
-          this.jobs.set(id, {status: 'pending'}); return;
-        }
         const currentDraft = this.saved.rooms[id]!.profiles[key];
         if (!currentDraft || programmeFingerprint(prepared.programme) !== programmeFingerprint(currentDraft)
           || programmeFingerprint(prepared.programme) !== programmeFingerprint(desired)) throw new Error('The saved programme changed during preparation.');
+        if (!preview && (obsolete() || !this.saved.rooms[id]!.enabled || this.saved.rooms[id]!.requestedProfile !== key)) {
+          await finishObsolete(); return;
+        }
         await this.transaction(() => {const current = this.saved.rooms[id]!;
           if (!current.profiles[key] || programmeFingerprint(current.profiles[key]!) !== programmeFingerprint(desired)) throw new Error('The saved programme changed before upload.');
-          current.inFlight = {profile: key, operationId: randomUUID()}; delete current.failure;});
+          current.inFlight = {profile: key, operationId}; delete current.failure; delete current.failureProfile;});
+        if (obsolete()) {await finishObsolete(); return;}
         if (this.closed || prepared.expiresAt <= Date.now()) throw new Error('Programme application stopped before upload.');
         dispatched = true;
-        const result = await provider.apply(prepared.token);
+        const result = await provider.apply(prepared.token, automatic ? {signal: automatic.abort.signal} : undefined);
         if (result.readback) await this.transaction(() => {this.observe(id, result.readback!);});
+        if (obsolete() && ((result.status === 'not-applied' && !result.writeAttempted)
+          || (result.superseded === true && result.status !== 'unknown' && result.status !== 'confirmed'))) {
+          await finishObsolete(); return;
+        }
         if (result.status !== 'confirmed' || !result.readback?.online || !result.readback.scheduled || !result.readback.programme
           || programmeFingerprint(result.readback.programme) !== programmeFingerprint(desired)) {
           throw new Error(`${result.reason} Do not automatically retry; read and verify this thermostat.`);
         }
+        if (obsolete()) {await finishObsolete(); return;}
+        let confirmed = false;
         await this.transaction(() => {const current = this.saved.rooms[id]!;
-          current.confirmation = {profile: key, programme: desired, at: Date.now()};
-          delete current.inFlight; delete current.failure;});
-        this.jobs.set(id, {status: 'verified', requestedProfile: key});
+          // A selection/draft edit can win the state queue after provider readback.
+          if (obsolete() || (!preview && (!current.enabled || current.requestedProfile !== key))
+            || !current.profiles[key] || programmeFingerprint(current.profiles[key]!) !== programmeFingerprint(desired)) {
+            if (current.inFlight?.operationId === operationId) delete current.inFlight;
+            delete current.confirmation; return;
+          }
+          current.confirmation = {profile: key, programme: desired, at: Date.now()}; confirmed = true;
+          delete current.inFlight; delete current.failure; delete current.failureProfile;});
+        this.jobs.set(id, {status: confirmed && !obsolete() ? 'verified' : 'pending', requestedProfile: key});
       } finally {
         if (prepared && !dispatched) await provider.discard?.(prepared.token).catch(() => undefined);
+        if (this.automatic.get(id) === automatic) this.automatic.delete(id);
       }
     }, key);
   }
@@ -549,12 +601,19 @@ export class HeatingController extends EventEmitter {
     this.jobs.set(id, {status, requestedProfile: key});
     const promise = Promise.resolve().then(task).catch(async error => {
       const reason = errorMessage(error);
-      this.pending.delete(id);
-      await this.transaction(() => {const room = this.saved.rooms[id]!; room.failure = reason; delete room.inFlight; delete room.confirmation;})
-        .catch(() => {this.saved.controls.recoveryRequired = 'Could not save the heating outcome. Review recovery.';});
+      // Retain a later different selection. It will acquire its own fresh baseline
+      // only after this operation and its provider queue have finished.
+      if (this.pending.get(id) === key) this.pending.delete(id);
+      await this.transaction(() => {const room = this.saved.rooms[id]!;
+        const unknownFailure = room.failure && room.failureProfile === undefined;
+        room.failure = reason;
+        if (!unknownFailure) room.failureProfile = key ?? null;
+        delete room.inFlight; delete room.confirmation;
+      }).catch(() => {this.saved.controls.recoveryRequired = 'Could not save the heating outcome. Review recovery.';});
       this.jobs.set(id, {status: 'failed', error: reason, requestedProfile: key});
       this.log.warn('Heating room operation needs attention.');
     }).finally(() => {
+      this.automatic.delete(id);
       this.running.delete(id);
       this.emit('change');
       this.drainPending(id);
@@ -566,8 +625,10 @@ export class HeatingController extends EventEmitter {
     if (this.running.has(id) || this.reserved.has(id)) return;
     const queued = this.pending.get(id);
     this.pending.delete(id);
-    if (queued && !this.closed && !this.saved.controls.recoveryRequired && !this.saved.rooms[id]!.failure
-      && this.saved.rooms[id]!.enabled && this.saved.rooms[id]!.requestedProfile === queued) this.launchApply(id, queued);
+    const room = this.saved.rooms[id];
+    if (queued && !this.closed && !this.saved.controls.recoveryRequired
+      && (!room?.failure || (room.failureProfile !== undefined && room.failureProfile !== queued))
+      && room?.enabled && room.requestedProfile === queued) this.launchApply(id, queued);
   }
   private schedulePolicy(): void {
     clearTimeout(this.timer);
@@ -589,6 +650,7 @@ export class HeatingController extends EventEmitter {
       const previous = structuredClone(this.saved), history = this.history.snapshot();
       try {change(); await this.save();}
       catch (error) {this.saved = previous; this.history.restore(history); throw error;}
+      this.cancelObsoleteAutomatic();
       this.emit('change');
     });
     this.stateQueue = operation.catch(() => undefined);
@@ -599,6 +661,7 @@ export class HeatingController extends EventEmitter {
     this.closed = true;
     this.ready = false;
     clearTimeout(this.timer); clearInterval(this.poll); this.pending.clear(); this.plans.clear();
+    for (const operation of this.automatic.values()) operation.abort.abort('closed');
     await this.refreshOperation; await this.idle(); await this.save();
     await this.legacyReadOnlyServer?.close(); await this.server.close();
   }

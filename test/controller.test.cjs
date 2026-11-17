@@ -44,13 +44,14 @@ class FakeProvider {
     this.previews.set(preview.token, preview);
     return clone(preview);
   }
-  async apply(token) {
+  async apply(token, options = {}) {
     const preview = this.previews.get(token);
     if (!preview) throw new Error('PREVIEW_CONSUMED');
     this.previews.delete(token);
     this.calls.push({operation: 'apply', desired: clone(preview.programme)});
-    if (this.beforeApply) await this.beforeApply(preview);
+    if (this.beforeApply) await this.beforeApply(preview, options);
     if (this.applyGate) await this.applyGate.promise;
+    if (this.honourAbort && options.signal?.aborted) return {status: 'not-applied', reason: 'Superseded before upload', writeAttempted: false};
     const outcome = this.outcomes.shift() ?? 'confirmed';
     if (outcome === 'throw') throw new Error('transport connection lost');
     if (outcome === 'confirmed' || outcome === 'unknown-matching') {
@@ -198,7 +199,7 @@ async function fixture(providers, callback, options = {}) {
   let controller;
   try {
     if (options.seed !== false) {
-      const controls = {...createThermostatControlPolicy(true, false), awayDelayMinutes: 0, ...options.controls};
+      const controls = {...createThermostatControlPolicy(true, false), ...options.controls};
       const rooms = Object.fromEntries(providers.map(provider => [`${provider.id}:${provider.suffix}`, savedRoom(provider, options.enabled !== false)]));
       await fs.writeFile(path.join(directory, 'HeatingProgrammes.json'), JSON.stringify({version: 1, controls, rooms}), {mode: 0o600});
     }
@@ -242,7 +243,7 @@ test('a household deadline passing during slow startup requires review and is no
     await new Promise(resolve => setTimeout(resolve, 20));
     assert.match(controller.view().controls.recoveryRequired, /deadline passed/);
     assert.equal(tuya.writes.length, 0);
-  }, {controls: {actualHome: false, effectiveHome: true, pendingAwayAt: Date.now() + 50}});
+  }, {controls: {actualHome: false, effectiveHome: false, holidayActive: true, returnAt: Date.now() + 50}});
 });
 
 test('startup restores saved profiles and household intent but neither confirms nor writes hardware', async () => {
@@ -345,7 +346,8 @@ test('controller migrates the legacy FastWarm state once without treating cached
     assert.equal(view.thermostats[0].name, 'Saved FastWarm name');
     assert.equal(view.thermostats[0].enabled, true);
     assert.equal(view.thermostats[0].sync.confirmedProfile, null);
-    assert.equal(view.presence.awayDelayMinutes, 13);
+    assert.equal(Object.hasOwn(view.presence, 'awayDelayMinutes'), false);
+    assert.equal(Object.hasOwn(view.presence, 'pendingAwayAt'), false);
     assert.deepEqual(view.thermostats[0].profiles.holiday, toEditor(programme(10)));
     assert.equal(view.migration.sourceFiles[0].sha256, crypto.createHash('sha256').update(bytes).digest('hex'));
     assert.equal((await controller.handle('/temperatures/history', {deviceId: 'tuya:zone1'})).temperatureHistory[0].currentTemperature, 17);
@@ -398,31 +400,28 @@ test('household Away and Holiday drive both providers with presence remembered u
   });
 });
 
-test('Away grace, guest hold, preheat and Holiday return retain one household policy', async () => {
+test('immediate Away, guest hold, preheat and Holiday return retain one household policy', async () => {
   const originalNow = Date.now; let clock = originalNow(); Date.now = () => clock;
   try {
     const hive = new FakeProvider('hive');
     await fixture([hive], async ({controller}) => {
-      await controller.handle('/controls/settings', {awayDelayMinutes: 10});
       await controller.handle('/presence', {home: false}); await settled(controller);
-      assert.equal(controller.view().selectedProfile, 'home');
-      assert.equal(hive.writes.length, 0);
-      assert.equal(controller.view().presence.pendingAwayAt, clock + 600000);
-      clock += 11 * 60000;
-      await controller.handle('/controls/settings', {awayDelayMinutes: 10}); await settled(controller);
       assert.equal(controller.view().selectedProfile, 'away');
+      assert.equal(hive.writes.length, 1);
+      assert.equal(Object.hasOwn(controller.view().presence, 'pendingAwayAt'), false);
       await controller.handle('/presence/hold', {until: clock + 20 * 60000}); await settled(controller);
       assert.equal(controller.view().selectedProfile, 'home');
       const returningAt = clock + 30 * 60000;
       await controller.handle('/holiday', {active: true, returnAt: returningAt, preheatMinutes: 5}); await settled(controller);
       assert.equal(controller.view().selectedProfile, 'holiday');
       clock = returningAt - 4 * 60000;
-      await controller.handle('/controls/settings', {awayDelayMinutes: 10}); await settled(controller);
+      await controller.handle('/presence', {home: false}); await settled(controller);
       assert.equal(controller.view().holiday.active, true);
       assert.equal(controller.view().holiday.preheating, true);
+      assert.equal(controller.homeActive, false, 'Home switch stays off throughout Holiday preheat');
       assert.equal(controller.view().selectedProfile, 'home');
       clock = returningAt + 1000;
-      await controller.handle('/controls/settings', {awayDelayMinutes: 10}); await settled(controller);
+      await controller.handle('/presence', {home: false}); await settled(controller);
       assert.equal(controller.view().holiday.active, false);
       assert.equal(controller.view().selectedProfile, 'away');
       assert.equal(hive.writes.at(-1).desired.monday[0].targetC, 12);
@@ -445,16 +444,19 @@ test('split provider outcome confirms successful rooms and reports failed rooms 
   });
 });
 
-test('unknown outcome is not confirmed by matching readback or retried after another policy choice', async () => {
+test('unknown outcome is not confirmed by matching readback; a different profile gets a fresh preparation', async () => {
   const hive = new FakeProvider('hive'); hive.outcomes.push('unknown-matching');
   await fixture([hive], async ({controller}) => {
     await controller.handle('/presence', {home: false}); await settled(controller);
     assert.equal(hive.zone.programme.monday[0].targetC, 12);
     assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, false);
     await controller.refresh();
+    await controller.handle('/presence', {home: false}); await settled(controller);
+    assert.equal(hive.writes.length, 1, 'identical failed selection was not retried');
     await controller.handle('/holiday', {active: true}); await settled(controller);
-    assert.equal(hive.writes.length, 1);
-    assert.match(controller.view().thermostats[0].sync.error, /previous programme operation needs review/);
+    assert.equal(hive.writes.length, 2);
+    assert.deepEqual(hive.writes.at(-1).desired, drafts().holiday);
+    assert.equal(controller.view().thermostats[0].sync.confirmedProfile, 'holiday');
   });
 });
 
@@ -663,4 +665,279 @@ test('concurrent runtime starts admit exactly one household owner', async () => 
     assert.equal(results.filter(result => result.status === 'fulfilled').length, 1,
       'descriptor probing alone must not allow both owners to start');
   } finally {await Promise.allSettled([first.close(), second.close()]); await cleanupPersist(directory);}
+});
+
+for (const system of ['tuya', 'hive']) {
+  test(`${system}: Home explicitly ends Holiday, while occupancy and Home off preserve Holiday`, async () => {
+    const provider = new FakeProvider(system);
+    await fixture([provider], async ({controller, readState}) => {
+      await controller.handle('/holiday', {active: true, returnAt: Date.now() + 3600000, preheatMinutes: 10});
+      await settled(controller);
+      assert.equal(controller.holidayActive, true); assert.equal(controller.homeActive, false);
+      assert.equal(controller.householdPresence, true);
+      const holidayWrites = provider.writes.length;
+      await controller.handle('/home', {home: false}); await settled(controller);
+      assert.equal(controller.householdPresence, false); assert.equal(controller.holidayActive, true);
+      await controller.handle('/presence', {home: true}); await settled(controller);
+      assert.equal(controller.householdPresence, true); assert.equal(controller.homeActive, false);
+      assert.equal(provider.writes.length, holidayWrites, 'occupancy changes do not cancel or reapply Holiday');
+      await controller.handle('/home', {home: true}); await settled(controller);
+      assert.equal(controller.holidayActive, false); assert.equal(controller.homeActive, true);
+      assert.equal(controller.view().selectedProfile, 'home');
+      assert.equal(controller.view().holiday.returnAt, null); assert.equal(controller.view().holiday.preheatMinutes, 0);
+      assert.equal(controller.view().holiday.preheating, false);
+      assert.deepEqual(provider.zone.programme, drafts().home);
+      assert.equal((await readState()).controls.holidayActive, false);
+    });
+  });
+
+  test(`${system}: a failed partial Holiday upload cannot discard a queued Home restore`, async () => {
+    const provider = new FakeProvider(system), entered = deferred(), gate = deferred();
+    let first = true, active = 0, maximum = 0, restoredFromMixed = false;
+    const originalApply = provider.apply.bind(provider);
+    provider.apply = async (...args) => {active++; maximum = Math.max(maximum, active); try {return await originalApply(...args);} finally {active--;}};
+    provider.outcomes.push('unknown');
+    provider.beforeApply = async (preview, {signal}) => {
+      if (!first) return;
+      first = false; assert.ok(signal instanceof AbortSignal);
+      provider.zone.programme = clone(preview.programme);
+      provider.zone.programme.monday[1].targetC = 20;
+      provider.zone.fingerprint = programmeFingerprint(provider.zone.programme);
+      entered.resolve(); await gate.promise;
+      assert.equal(signal.aborted, true, 'new Home intent invalidates the obsolete Holiday operation');
+    };
+    provider.beforePrepare = () => {if (!first && provider.zone.programme.monday[1].targetC === 20) restoredFromMixed = true;};
+    await fixture([provider], async ({controller}) => {
+      await controller.handle('/holiday', {active: true}); await entered.promise;
+      await controller.handle('/home', {home: true});
+      assert.equal(controller.view().thermostats[0].sync.queuedProfile, 'home');
+      gate.resolve(); await settled(controller);
+      assert.equal(provider.writes.length, 2); assert.equal(maximum, 1);
+      assert.equal(restoredFromMixed, true, 'restore acquired its own fresh baseline after the failed partial upload');
+      assert.deepEqual(provider.zone.programme, drafts().home, 'every period, including Monday Leave, was restored');
+      assert.equal(controller.view().thermostats[0].sync.confirmedProfile, 'home');
+      assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, true);
+      assert.deepEqual(provider.calls.filter(call => call.operation === 'prepare').map(call => call.options),
+        [{requireScheduled: true}, {requireScheduled: true}]);
+      assert.equal(provider.calls.some(call => call.operation === 'read'), false, 'controller adds no separate baseline read');
+    });
+  });
+
+  test(`${system}: a superseded success is not used to confirm a later household selection`, async () => {
+    const provider = new FakeProvider(system), entered = deferred(), oldGate = deferred(), newEntered = deferred(), newGate = deferred();
+    let first = true, preparations = 0;
+    provider.beforeApply = async () => {if (first) {first = false; entered.resolve(); await oldGate.promise;}};
+    provider.beforePrepare = async () => {if (++preparations === 2) {newEntered.resolve(); await newGate.promise;}};
+    await fixture([provider], async ({controller}) => {
+      await controller.handle('/home', {home: false}); await entered.promise;
+      await controller.handle('/home', {home: true}); oldGate.resolve(); await newEntered.promise;
+      const during = controller.view().thermostats[0];
+      assert.equal(during.sync.requestedProfile, 'home'); assert.equal(during.sync.confirmedProfile, null);
+      assert.equal(during.sync.confirmationMatchesRequested, false);
+      assert.deepEqual(provider.zone.programme, drafts().away, 'already-submitted single upload may finish');
+      newGate.resolve(); await settled(controller);
+      assert.deepEqual(provider.zone.programme, drafts().home);
+      assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, true);
+    });
+  });
+
+  test(`${system}: a failed identical queued request is not automatically replayed`, async () => {
+    const provider = new FakeProvider(system), entered = deferred(), gate = deferred();
+    provider.outcomes.push('unknown');
+    provider.beforeApply = async () => {entered.resolve(); await gate.promise;};
+    await fixture([provider], async ({controller}) => {
+      await controller.handle('/home', {home: false}); await entered.promise;
+      await controller.handle('/home', {home: true});
+      await controller.handle('/home', {home: false});
+      gate.resolve(); await settled(controller);
+      assert.equal(provider.writes.length, 1);
+      assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, false);
+      await controller.refresh(); await controller.handle('/home', {home: false}); await settled(controller);
+      assert.equal(provider.writes.length, 1, 'cached matching state and repeated intent cannot replay an uncertain write');
+    });
+  });
+}
+
+test('a cancel-capable provider stops an obsolete upload before its first write, then applies only the latest intent', async () => {
+  const tuya = new FakeProvider('tuya'), entered = deferred(), gate = deferred(); let first = true;
+  tuya.honourAbort = true;
+  tuya.beforeApply = async (_preview, {signal}) => {if (first) {first = false; entered.resolve(); await gate.promise; assert.equal(signal.aborted, true);}};
+  await fixture([tuya], async ({controller}) => {
+    await controller.handle('/home', {home: false}); await entered.promise;
+    await controller.handle('/holiday', {active: true});
+    await controller.handle('/home', {home: true}); gate.resolve(); await settled(controller);
+    assert.equal(tuya.writes.length, 2, 'the obsolete invocation reports not-applied; only the latest programme is written');
+    assert.deepEqual(tuya.zone.programme, drafts().home);
+    assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, true);
+  });
+});
+
+test('Holiday cannot end with unknown occupancy; explicit Home resolves it and clears return settings', async () => {
+  const hive = new FakeProvider('hive');
+  await fixture([hive], async ({controller, readState}) => {
+    assert.equal(controller.homeActive, false); assert.equal(controller.householdPresence, null);
+    const before = await readState();
+    await assert.rejects(controller.handle('/holiday', {active: false}), /Set household presence/);
+    assert.deepEqual(await readState(), before); assert.equal(hive.writes.length, 0);
+    await controller.handle('/home', {home: true}); await settled(controller);
+    assert.equal(controller.homeActive, true); assert.equal(controller.holidayActive, false);
+    assert.equal(controller.view().selectedProfile, 'home'); assert.deepEqual(hive.zone.programme, drafts().home);
+  }, {controls: {actualHome: null, effectiveHome: null, holidayActive: true, returnAt: Date.now() + 3600000, preheatMinutes: 5}});
+});
+
+test('removed departure settings route cannot change household intent or send commands', async () => {
+  const hive = new FakeProvider('hive');
+  await fixture([hive], async ({controller, readState}) => {
+    const before = await readState();
+    await assert.rejects(controller.handle('/controls/settings', {awayDelayMinutes: 10}), /Unsupported/);
+    assert.deepEqual(await readState(), before); assert.equal(hive.writes.length, 0);
+    await controller.handle('/home', {home: false}); await settled(controller);
+    assert.equal(controller.view().selectedProfile, 'away'); assert.equal(hive.writes.length, 1);
+  });
+});
+
+test('an expired guest hold cannot supply known occupancy when ending Holiday', async () => {
+  const hive = new FakeProvider('hive'), realNow = Date.now;
+  let now = realNow(); Date.now = () => now;
+  try {
+    await fixture([hive], async ({controller, readState}) => {
+      await controller.handle('/presence/hold', {until: now + 60000});
+      now += 60001;
+      const before = await readState();
+      await assert.rejects(controller.handle('/holiday', {active: false}), /Set household presence/);
+      assert.deepEqual(await readState(), before);
+      assert.equal(controller.holidayActive, true);
+      assert.equal(hive.writes.length, 0);
+    }, {controls: {actualHome: null, effectiveHome: null, holidayActive: true}});
+  } finally {Date.now = realNow;}
+});
+
+for (const oldDeadline of [Date.now() - 60000, Date.now() + 3600000]) test(`legacy Away countdown ${oldDeadline} is discarded without startup writes`, async () => {
+  const tuya = new FakeProvider('tuya'), hive = new FakeProvider('hive');
+  await fixture([tuya, hive], async ({controller, readState}) => {
+    assert.equal(controller.view().controls.recoveryRequired, null);
+    assert.equal(controller.view().presence.home, false);
+    assert.equal(controller.view().selectedProfile, 'home', 'startup retains the stored effective programme without a new command');
+    assert.equal(tuya.writes.length + hive.writes.length, 0);
+    const saved = await readState();
+    assert.equal(Object.hasOwn(saved.controls, 'pendingAwayAt'), false);
+    assert.equal(Object.hasOwn(saved.controls, 'awayDelayMinutes'), false);
+    await controller.handle('/home', {home: false}); await settled(controller);
+    assert.equal(controller.view().selectedProfile, 'away');
+    assert.equal(tuya.writes.length + hive.writes.length, 2);
+  }, {controls: {actualHome: false, effectiveHome: true, awayDelayMinutes: 30, pendingAwayAt: oldDeadline}});
+});
+
+test('shutdown aborts an automatic operation and never drains a queued programme', async () => {
+  const hive = new FakeProvider('hive'), entered = deferred(), gate = deferred(); let signal;
+  hive.beforeApply = async (_preview, options) => {signal = options.signal; entered.resolve(); await gate.promise;};
+  await fixture([hive], async ({controller}) => {
+    await controller.handle('/home', {home: false}); await entered.promise;
+    await controller.handle('/holiday', {active: true});
+    const closing = controller.close(); assert.equal(signal.aborted, true);
+    gate.resolve(); await closing;
+    assert.equal(hive.writes.length, 1); assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, false);
+  });
+});
+
+test('a manual reviewed upload keeps its exact programme and cannot confirm a concurrently edited draft', async () => {
+  const hive = new FakeProvider('hive'), entered = deferred(), gate = deferred();
+  hive.beforeApply = async (_preview, {signal}) => {assert.equal(signal, undefined); entered.resolve(); await gate.promise;};
+  await fixture([hive], async ({controller}) => {
+    const preview = await controller.handle('/schedules/apply', {deviceIds: ['hive:zone1'], profile: 'away', preview: true});
+    await controller.handle('/schedules/apply', {previewId: preview.preview.id}); await entered.promise;
+    await controller.handle('/profiles/save', {deviceId: 'hive:zone1', profile: 'away', schedule: toEditor(programme(11))});
+    gate.resolve(); await settled(controller);
+    assert.equal(hive.writes.length, 1); assert.deepEqual(hive.zone.programme, drafts().away, 'only the reviewed programme was uploaded');
+    const room = controller.view().thermostats[0];
+    assert.deepEqual(room.profiles.away, toEditor(programme(11))); assert.equal(room.sync.confirmedProfile, null);
+    assert.equal(room.sync.status, 'pending'); assert.equal(room.sync.confirmationMatchesRequested, false);
+  });
+});
+
+test('failed request identity survives restart without replay and allows a later different explicit profile', async () => {
+  const directory = await temporaryPersist('heating-failed-identity-'), hive = new FakeProvider('hive');
+  let first, second;
+  try {
+    const controls = createThermostatControlPolicy(true, false), rooms = {'hive:zone1': savedRoom(hive)};
+    await fs.writeFile(path.join(directory, 'HeatingProgrammes.json'), JSON.stringify({version: 1, controls, rooms}), {mode: 0o600});
+    first = new HeatingController(directory, [hive], {warn() {}});
+    await first.start({publishServer: false, poll: false, migrate: false});
+    hive.outcomes.push('unknown');
+    await first.handle('/home', {home: false}); await settled(first);
+    const failed = JSON.parse(await fs.readFile(path.join(directory, 'HeatingProgrammes.json'), 'utf8'));
+    assert.equal(failed.rooms['hive:zone1'].failureProfile, 'away');
+    await first.close(); first = undefined;
+    second = new HeatingController(directory, [hive], {warn() {}});
+    await second.start({publishServer: false, poll: false, migrate: false});
+    assert.equal(hive.writes.length, 1, 'restart never replays the failed request');
+    await second.handle('/home', {home: false}); await settled(second); assert.equal(hive.writes.length, 1);
+    await second.handle('/holiday', {active: true}); await settled(second);
+    assert.equal(hive.writes.length, 2); assert.deepEqual(hive.zone.programme, drafts().holiday);
+    assert.equal(second.view().thermostats[0].sync.confirmationMatchesRequested, true);
+  } finally {
+    if (first) await first.close(); if (second) await second.close(); await cleanupPersist(directory);
+  }
+});
+
+test('an explicit Home after restart restores the newer selection interrupted by an older Holiday operation', async () => {
+  const directory = await temporaryPersist('heating-interrupted-restore-'), hive = new FakeProvider('hive');
+  let controller;
+  try {
+    const controls = createThermostatControlPolicy(true, false), room = savedRoom(hive);
+    room.requestedProfile = 'home'; room.inFlight = {profile: 'holiday', operationId: crypto.randomUUID()};
+    hive.zone.programme = drafts().holiday; hive.zone.fingerprint = programmeFingerprint(hive.zone.programme);
+    await fs.writeFile(path.join(directory, 'HeatingProgrammes.json'), JSON.stringify({version: 1, controls, rooms: {'hive:zone1': room}}), {mode: 0o600});
+    controller = new HeatingController(directory, [hive], {warn() {}});
+    await controller.start({publishServer: false, poll: false, migrate: false});
+    assert.equal(hive.writes.length, 0, 'startup does not replay either interrupted or queued intent');
+    await controller.handle('/home', {home: true}); await settled(controller);
+    assert.equal(hive.writes.length, 1, 'explicit newer Home is different from the interrupted Holiday request');
+    assert.deepEqual(hive.zone.programme, drafts().home);
+    assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, true);
+    await controller.handle('/home', {home: true}); await settled(controller);
+    assert.equal(hive.writes.length, 1, 'an already confirmed identical selection costs no request');
+  } finally {if (controller) await controller.close(); await cleanupPersist(directory);}
+});
+
+test('a known partial cancellation permits a fresh latest Away after Away → Home → Away', async () => {
+  const tuya = new FakeProvider('tuya'), entered = deferred(), gate = deferred();
+  const originalApply = tuya.apply.bind(tuya); let applications = 0;
+  tuya.outcomes.push('unknown');
+  tuya.apply = async (token, options) => {
+    const number = ++applications, result = await originalApply(token, options);
+    return number === 1 ? {...result, status: 'unconfirmed', superseded: true} : result;
+  };
+  let first = true;
+  tuya.beforeApply = async (preview, {signal}) => {
+    if (!first) return;
+    first = false; entered.resolve(); await gate.promise;
+    assert.equal(signal.aborted, true);
+    tuya.zone.programme = clone(preview.programme); tuya.zone.programme.monday[1].targetC = 20;
+    tuya.zone.fingerprint = programmeFingerprint(tuya.zone.programme);
+  };
+  await fixture([tuya], async ({controller}) => {
+    await controller.handle('/home', {home: false}); await entered.promise;
+    await controller.handle('/home', {home: true}); await controller.handle('/home', {home: false});
+    gate.resolve(); await settled(controller);
+    assert.equal(tuya.writes.length, 2, 'proven cancellation is not an uncertain failed-write replay');
+    assert.deepEqual(tuya.zone.programme, drafts().away, 'fresh latest intent repairs all 28 periods');
+    assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, true);
+    assert.equal(controller.view().thermostats[0].sync.confirmedProfile, 'away');
+  });
+});
+
+test('a supersession flag cannot turn an unknown write into an identical automatic retry', async () => {
+  const tuya = new FakeProvider('tuya'), entered = deferred(), gate = deferred();
+  const originalApply = tuya.apply.bind(tuya);
+  tuya.outcomes.push('unknown');
+  tuya.apply = async (...args) => ({...await originalApply(...args), superseded: true});
+  tuya.beforeApply = async () => {entered.resolve(); await gate.promise;};
+  await fixture([tuya], async ({controller}) => {
+    await controller.handle('/home', {home: false}); await entered.promise;
+    await controller.handle('/home', {home: true}); await controller.handle('/home', {home: false});
+    gate.resolve(); await settled(controller);
+    assert.equal(tuya.writes.length, 1); assert.equal(controller.view().thermostats[0].sync.confirmationMatchesRequested, false);
+    assert.equal(controller.view().thermostats[0].sync.status, 'failed');
+  });
 });

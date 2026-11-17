@@ -52,7 +52,7 @@ test('migrates every period, names, rules, enrolment and measured history withou
   assert.equal(room.profiles.home.monday.length, 4);
   assert.equal(room.profiles.home.monday[0].startMinute, 330);
   assert.deepEqual(room.profiles.home.monday, room.profiles.home.sunday);
-  assert.equal(result.controls.awayDelayMinutes, 17);
+  assert.equal(Object.hasOwn(result.controls, 'awayDelayMinutes'), false);
   assert.equal(result.controls.actualHome, true);
   assert.equal(room.history.temperatures[0].at, now - 3000);
   assert.equal(room.history.temperatures[0].sourceAt, now - 4000);
@@ -79,7 +79,7 @@ test('old version without controls preserves unknown presence without inventing 
   await write(directory, source);
   const result = await readLegacyMigration(directory, now);
   assert.equal(result.controls.actualHome, null);
-  assert.equal(result.controls.pendingAwayAt, null);
+  assert.equal(Object.hasOwn(result.controls, 'pendingAwayAt'), false);
   assert.equal(result.controls.returnAt, null);
 }));
 
@@ -94,7 +94,7 @@ test('overdue timers require review instead of replaying Home/Away or Holiday', 
   assert.match(result.recoveryRequired, /deadline passed/);
   assert.equal(result.controls.holidayActive, true);
   assert.equal(result.controls.effectiveHome, true);
-  assert.equal(result.controls.pendingAwayAt, now - 1);
+  assert.equal(Object.hasOwn(result.controls, 'pendingAwayAt'), false);
 }));
 
 test('interrupted uploads and active overrides block shared automation without resuming them', () => withDirectory(async directory => {
