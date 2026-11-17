@@ -93,7 +93,9 @@ export class HiveIpcTransport implements HiveProgrammeTransport {
   async writeSchedule(
     zone: { readonly id: string; readonly type: HiveZoneType },
     command: HiveScheduleCommand,
+    options: {readonly signal?: AbortSignal} = {},
   ): Promise<HiveWriteAcknowledgement> {
+    if (options.signal?.aborted) throw new HiveTransportError('HIVE_PROGRAMME_SUPERSEDED', 'not-sent');
     const descriptor = await this.readDescriptor();
     if (!descriptor.capabilities.write || !descriptor.capabilities.enrolledZoneIds.includes(zone.id)) {
       throw new HiveTransportError('HIVE_PROGRAMME_WRITES_NOT_ENABLED', 'not-sent');
@@ -104,6 +106,7 @@ export class HiveIpcTransport implements HiveProgrammeTransport {
     if (!Number.isSafeInteger(command.expiresAt) || command.expiresAt <= Date.now()) {
       throw new HiveTransportError('HIVE_PROGRAMME_PREVIEW_EXPIRED', 'not-sent');
     }
+    if (options.signal?.aborted) throw new HiveTransportError('HIVE_PROGRAMME_SUPERSEDED', 'not-sent');
     const { status, body } = await this.call(descriptor, '/schedules/write', {
       deviceId: zone.id,
       type: zone.type,

@@ -50,14 +50,14 @@ export class HeatingProgrammesPlatform implements DynamicPlatformPlugin {
     const bind = (service: ReturnType<PlatformAccessory['addService']>, role: 'home' | 'holiday') => {
       const on = service.getCharacteristic(Characteristic.On);
       on.onGet(() => {
-        if (role === 'home' && controller.householdPresence === null) throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-        return role === 'home' ? controller.householdPresence! : controller.holidayActive;
+        if (role === 'home' && controller.homeActive === null) throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+        return role === 'home' ? controller.homeActive! : controller.holidayActive;
       });
-      on.onSet(async value => {await controller.handle(role === 'home' ? '/presence' : '/holiday',
+      on.onSet(async value => {await controller.handle(role === 'home' ? '/home' : '/holiday',
         role === 'home' ? {home: Boolean(value)} : {active: Boolean(value)});});
       const update = () => {
-        if (role === 'holiday' || controller.householdPresence !== null) on.updateValue(
-          role === 'home' ? controller.householdPresence! : controller.holidayActive);
+        if (role === 'holiday' || controller.homeActive !== null) on.updateValue(
+          role === 'home' ? controller.homeActive! : controller.holidayActive);
       };
       controller.on('change', update);
       const dispose = () => controller.off('change', update);

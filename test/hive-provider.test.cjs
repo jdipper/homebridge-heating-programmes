@@ -113,3 +113,60 @@ test('automatic Hive preparation refuses Hold/boost mode before any write previe
   assert.equal(transport.reads, 1);
   assert.equal(transport.posts, 0);
 });
+
+test('superseding a prepared Hive selection consumes its token without another cloud read or write', async () => {
+  const transport = new GuardedTransport(), p = provider(transport), abort = new AbortController();
+  const prepared = await p.prepare(id, week(12), undefined, {requireScheduled: true});
+  abort.abort();
+  const result = await p.apply(prepared.token, {signal: abort.signal});
+  assert.equal(result.status, 'not-applied');
+  assert.equal(result.reason, 'PROGRAMME_SUPERSEDED');
+  assert.equal(result.writeAttempted, false);
+  assert.equal(transport.reads, 1);
+  assert.equal(transport.posts, 0);
+  await assert.rejects(p.apply(prepared.token), /UNKNOWN_OR_CONSUMED_PREVIEW/);
+});
+
+test('discarding an obsolete Hive preparation is local and prevents a later upload', async () => {
+  const transport = new GuardedTransport(), p = provider(transport);
+  const prepared = await p.prepare(id, week(12));
+  await p.discard(prepared.token);
+  await assert.rejects(p.apply(prepared.token), /UNKNOWN_OR_CONSUMED_PREVIEW/);
+  assert.equal(transport.reads, 1);
+  assert.equal(transport.posts, 0);
+});
+
+test('a Hive selection superseded during a private capability check never submits its week', async () => {
+  const transport = new GuardedTransport(), p = provider(transport), abort = new AbortController();
+  const prepared = await p.prepare(id, week(12));
+  transport.supportsFreshWritePreconditions = async () => {abort.abort(); return true;};
+  const result = await p.apply(prepared.token, {signal: abort.signal});
+  assert.equal(result.status, 'not-applied');
+  assert.equal(result.reason, 'PROGRAMME_SUPERSEDED');
+  assert.equal(transport.reads, 1);
+  assert.equal(transport.commands.length, 0);
+});
+
+test('a Hive selection superseded during the legacy fresh baseline read never submits its week', async () => {
+  const transport = new GuardedTransport(false), p = provider(transport), abort = new AbortController();
+  const prepared = await p.prepare(id, week(12));
+  const read = transport.readProducts.bind(transport);
+  transport.readProducts = async () => {const value = await read(); abort.abort(); return value;};
+  const result = await p.apply(prepared.token, {signal: abort.signal});
+  assert.equal(result.status, 'not-applied');
+  assert.equal(result.reason, 'PROGRAMME_SUPERSEDED');
+  assert.equal(transport.reads, 2);
+  assert.equal(transport.commands.length, 0);
+});
+
+test('superseding an already submitted Hive week lets that single command finish without replay', async () => {
+  const transport = new GuardedTransport(), p = provider(transport), abort = new AbortController();
+  const write = transport.writeSchedule.bind(transport);
+  transport.writeSchedule = async (...args) => {abort.abort(); return write(...args);};
+  const prepared = await p.prepare(id, week(12));
+  const result = await p.apply(prepared.token, {signal: abort.signal});
+  assert.equal(result.status, 'confirmed');
+  assert.equal(transport.posts, 1);
+  assert.equal(transport.commands.length, 1);
+  assert.equal(transport.reads, 3);
+});

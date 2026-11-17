@@ -37,7 +37,8 @@ export interface HiveProgrammeTransport {
   readProducts(): Promise<readonly HiveProduct[]>;
   /** A private capability check, not a cloud read. Unadvertised transports keep the client guard. */
   supportsFreshWritePreconditions?(): Promise<boolean>;
-  writeSchedule(zone: {readonly id: string; readonly type: HiveZoneType}, command: HiveScheduleCommand): Promise<HiveWriteAcknowledgement>;
+  writeSchedule(zone: {readonly id: string; readonly type: HiveZoneType}, command: HiveScheduleCommand,
+    options?: {readonly signal?: AbortSignal}): Promise<HiveWriteAcknowledgement>;
 }
 
 /** Only use not-sent when the transport can prove it did not issue the request. */
@@ -278,7 +279,7 @@ export class HiveProgrammeAdapter {
     });
   }
 
-  async apply(token: string): Promise<ApplyResult> {
+  async apply(token: string, options: {readonly signal?: AbortSignal} = {}): Promise<ApplyResult> {
     const queued = this.previews.get(token);
     requireProgramme(queued, 'UNKNOWN_OR_CONSUMED_PREVIEW');
     return this.serial(queued.view.zone.id, async () => {
@@ -288,6 +289,7 @@ export class HiveProgrammeAdapter {
       const zoneId = record.view.zone.id;
       const result = (status: ApplyResult['status'], reason: string, writeAttempted: boolean,
         acknowledged = false, readback?: HiveZoneSnapshot): ApplyResult => Object.freeze({status, reason, zoneId, writeAttempted, acknowledged, readback});
+      if (options.signal?.aborted) return result('not-applied', 'PROGRAMME_SUPERSEDED', false);
       if (this.now() >= record.view.expiresAt) return result('not-applied', 'PREVIEW_EXPIRED', false);
       let before: Observation;
       let guardedWrite = false;
@@ -310,16 +312,23 @@ export class HiveProgrammeAdapter {
       // Authentication and the fresh read can outlast a nearly expired preview.
       // No asynchronous work may occur between this check and the apply decision.
       if (this.now() >= record.view.expiresAt) return result('not-applied', 'PREVIEW_EXPIRED', false, false, before.snapshot);
+      if (options.signal?.aborted) return result('not-applied', 'PROGRAMME_SUPERSEDED', false, false, before.snapshot);
       if (!record.view.changesRequired) return result('confirmed', 'PROGRAMME_ALREADY_MATCHES', false, false, before.snapshot);
       let acknowledged = false;
       let uncertain = false;
       let notSent = false;
       try {
-        const reply = await this.transport.writeSchedule({id: zoneId, type: before.snapshot.type}, command);
+        // The whole-week command is one operation. Once submitted it is allowed
+        // to finish; never abort its connection and invent a known write outcome.
+        const reply = await this.transport.writeSchedule({id: zoneId, type: before.snapshot.type}, command,
+          options.signal ? {signal: options.signal} : undefined);
         acknowledged = acknowledgementMatches(reply, record.view.programme);
         uncertain = !acknowledged;
       } catch (error) {
         notSent = error instanceof HiveTransportError && error.outcome === 'not-sent';
+        if (notSent && (error as HiveTransportError).code === 'HIVE_PROGRAMME_SUPERSEDED') {
+          return result('not-applied', 'PROGRAMME_SUPERSEDED', false);
+        }
         uncertain = !notSent;
       }
       let after: Observation | undefined;
@@ -341,6 +350,8 @@ export class HiveProgrammeAdapter {
         : result('unconfirmed', 'NATIVE_WEEK_OR_CONTROLS_NOT_CONFIRMED', true, acknowledged, after.snapshot);
     });
   }
+
+  discard(token: string): void {this.previews.delete(token);}
 
   private async observe(zoneId: string): Promise<Observation> {
     requireProgramme(typeof zoneId === 'string' && /^[A-Za-z0-9-]{6,100}$/.test(zoneId), 'INVALID_HIVE_ZONE_ID');

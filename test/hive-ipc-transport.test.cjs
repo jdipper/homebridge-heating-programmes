@@ -9,6 +9,13 @@ const { HiveIpcTransport } = require('../dist/hive/HiveIpcTransport.js');
 const zone = { id: 'test-zone', type: 'heating' };
 const command = { schedule: {}, preconditions: {}, expiresAt: Date.now() + 60_000 };
 
+test('an already superseded Hive selection refuses dispatch before reading a descriptor', async () => {
+  const client = new HiveIpcTransport({storagePath: '/not-a-homebridge-storage'}), abort = new AbortController();
+  abort.abort();
+  await assert.rejects(client.writeSchedule(zone, command, {signal: abort.signal}),
+    error => error.code === 'HIVE_PROGRAMME_SUPERSEDED' && error.outcome === 'not-sent');
+});
+
 async function fixture(t, options = {}) {
   // macOS's default per-user temporary path exceeds its Unix socket length limit.
   const root = await fs.mkdtemp(path.join(process.platform === 'darwin' ? '/private/tmp' : os.tmpdir(), 'hive-ipc-test-'));
@@ -70,6 +77,14 @@ test('guarded writes ask the runtime to preserve its fresh precondition check', 
   await client.writeSchedule(zone, {...command, requireFreshPreconditions: true});
   assert.equal(seen.length, 1);
   assert.equal(seen[0].body.requireFreshPreconditions, true);
+});
+
+test('superseding a Hive selection while its private descriptor is read sends no IPC write', async t => {
+  const {client, seen} = await fixture(t, {write: true, freshWritePreconditions: true}), abort = new AbortController();
+  const pending = client.writeSchedule(zone, {...command, requireFreshPreconditions: true}, {signal: abort.signal});
+  abort.abort();
+  await assert.rejects(pending, error => error.code === 'HIVE_PROGRAMME_SUPERSEDED' && error.outcome === 'not-sent');
+  assert.equal(seen.length, 0);
 });
 
 test('unadvertised providers retain the legacy path and cannot accept guarded writes', async t => {

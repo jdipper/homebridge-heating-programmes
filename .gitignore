@@ -2,3 +2,12 @@ node_modules
 dist/
 *.tgz
 coverage/
+.env
+.env.*
+.npmrc
+config.json
+persist/
+accessories/
+heating-runtime/
+local-packages/
+*.log

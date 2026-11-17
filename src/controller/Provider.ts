@@ -33,11 +33,17 @@ export interface ProviderApplyResult {
   status: 'confirmed' | 'conflict' | 'not-applied' | 'unconfirmed' | 'unknown';
   reason: string;
   writeAttempted: boolean;
+  /** Explicit proof of known supersession, never an unknown or failed native write. */
+  superseded?: boolean;
   readback?: HeatingZone;
 }
 export interface ProviderPrepareOptions {
   /** Automatic household changes must not cancel a manual Hold or boost. */
   requireScheduled?: boolean;
+}
+export interface ProviderApplyOptions {
+  /** Superseding household intent stops commands that have not yet been submitted. */
+  signal?: AbortSignal;
 }
 /** Vendor plugins retain authentication and wire operations; only the controller selects profiles. */
 export interface ProgrammeProvider {
@@ -48,7 +54,7 @@ export interface ProgrammeProvider {
   read(deviceId: string): Promise<HeatingZone>;
   prepare(deviceId: string, programme: WeeklyProgramme, expectedFingerprint?: string,
     options?: ProviderPrepareOptions): Promise<ProviderPreview>;
-  apply(token: string): Promise<ProviderApplyResult>;
+  apply(token: string, options?: ProviderApplyOptions): Promise<ProviderApplyResult>;
   /** Release a queue-owned automatic baseline when draft/policy checks abort before apply. */
   discard?(token: string): Promise<void>;
 }

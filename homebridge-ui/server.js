@@ -9,7 +9,7 @@ const PLUGIN = '@jdipper/homebridge-heating-programmes';
 const ROUTES = [
   '/thermostats', '/rooms/refresh', '/rooms/save', '/temperatures/history', '/profiles/history',
   '/profiles/restore', '/schedules/read', '/profiles/save', '/schedules/apply', '/profiles/select',
-  '/controls/settings', '/presence/hold', '/controls/recover', '/presence', '/holiday',
+  '/presence/hold', '/controls/recover', '/presence', '/home', '/holiday',
 ];
 
 function owned(info, privateFile = true) {

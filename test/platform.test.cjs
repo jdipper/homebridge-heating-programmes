@@ -23,9 +23,11 @@ class FakeController extends EventEmitter {
     await Promise.all(this.providers.map(provider => provider.list()));
   }
   async close() { this.closed = true; }
+  get homeActive() { return this.holidayActive ? false : this.householdPresence; }
   async handle(route, body) {
     this.calls.push({ route, body });
     if (route === '/presence') { this.householdPresence = body.home; }
+    if (route === '/home') { this.householdPresence = body.home; if (body.home) { this.holidayActive = false; } }
     if (route === '/holiday') { this.holidayActive = body.active; }
     this.emit('change'); return {};
   }
@@ -124,17 +126,49 @@ test('unknown presence reports a HomeKit communication error without inventing A
   await f.shutdown();
 });
 
-test('Home on/off dispatches only household presence and Holiday dispatches its own state', async () => {
+test('Home on/off dispatches explicit Home selections while Holiday dispatches its own state', async () => {
   const f = fixture(); await f.launch();
   await f.on('home').set(true);
   await f.on('home').set(false);
   await f.on('holiday').set(true);
   await f.on('holiday').set(false);
   assert.deepEqual(f.state.controllers[0].calls, [
-    { route: '/presence', body: { home: true } }, { route: '/presence', body: { home: false } },
+    { route: '/home', body: { home: true } }, { route: '/home', body: { home: false } },
     { route: '/holiday', body: { active: true } }, { route: '/holiday', body: { active: false } },
   ]);
   assert.equal(f.state.providerWrites, 0);
+  await f.shutdown();
+});
+
+test('Holiday hides unknown occupancy behind Home off without losing the unknown-presence error after Holiday ends', async () => {
+  const f = fixture({}, { initialHoliday: true }); await f.launch();
+  assert.equal(f.on('home').get(), false);
+  assert.equal(f.on('holiday').get(), true);
+  assert.deepEqual(f.on('home').updates, [false]);
+  const controller = f.state.controllers[0];
+  assert.equal(controller.householdPresence, null);
+  controller.holidayActive = false; controller.emit('change');
+  assert.throws(() => f.on('home').get(), error => error instanceof Unavailable && error.status === -70402);
+  assert.equal(f.on('holiday').get(), false);
+  assert.deepEqual(controller.calls, []);
+  await f.shutdown();
+});
+
+test('the grouped Home switch ends Holiday explicitly while raw presence and Home off only remember occupancy', async () => {
+  const f = fixture({}, { initialPresence: true, initialHoliday: true }); await f.launch();
+  const controller = f.state.controllers[0], owner = f.controls();
+  assert.equal(f.on('home').get(), false);
+  await controller.handle('/presence', { home: false });
+  assert.equal(f.on('home').get(), false); assert.equal(f.on('holiday').get(), true);
+  await f.on('home').set(false);
+  assert.equal(controller.householdPresence, false); assert.equal(f.on('holiday').get(), true);
+  await f.on('home').set(true);
+  assert.deepEqual(controller.calls.slice(-2), [
+    { route: '/home', body: { home: false } }, { route: '/home', body: { home: true } },
+  ]);
+  assert.equal(f.on('home').get(), true); assert.equal(f.on('holiday').get(), false);
+  assert.equal(f.controls(), owner); assert.equal(owner.services.filter(service => service.type === 'switch').length, 2);
+  assert.equal(f.unregistered.length, 0);
   await f.shutdown();
 });
 
@@ -142,7 +176,7 @@ test('editor/controller changes update both HomeKit switches and shutdown remove
   const f = fixture(); await f.launch();
   const controller = f.state.controllers[0];
   controller.householdPresence = true; controller.holidayActive = true; controller.emit('change');
-  assert.equal(f.on('home').value, true);
+  assert.equal(f.on('home').value, false);
   assert.equal(f.on('holiday').value, true);
   assert.equal(controller.listenerCount('change'), 2);
   await f.shutdown();
@@ -163,7 +197,7 @@ test('cached combined identity and custom names survive restart without duplicat
   assert.equal(cached.displayName, 'Custom Heating');
   assert.deepEqual(['home', 'holiday'].map(role => cached.getServiceById('switch', role).getCharacteristic('configured-name').value), ['My home', 'My holiday']);
   assert.equal(cached.services.filter(service => service.type === 'switch').length, 2);
-  assert.equal(f.on('home').get(), true); assert.equal(f.on('holiday').get(), true);
+  assert.equal(f.on('home').get(), false); assert.equal(f.on('holiday').get(), true);
   assert.equal(f.unregistered.length, 0);
   assert.deepEqual(f.state.controllers[0].calls, []);
   await f.shutdown();
@@ -246,7 +280,7 @@ test('legacy separate Home/Holiday accessories retire only after the complete co
   assert.deepEqual(f.unregistered[0].accessories, [previous.home, previous.holiday]);
   assert.equal(f.state.controllers[0].listenerCount('change'), 2);
   assert.deepEqual(f.state.controllers[0].calls, []); assert.equal(f.state.providerWrites, 0);
-  await f.on('holiday').set(true); assert.equal(f.on('home').get(), true); assert.equal(f.on('holiday').get(), true);
+  await f.on('holiday').set(true); assert.equal(f.on('home').get(), false); assert.equal(f.on('holiday').get(), true);
   await f.shutdown(); assert.equal(f.state.controllers[0].listenerCount('change'), 0);
 });
 
@@ -267,7 +301,7 @@ test('failed grouped registration preserves both old accessories and binds their
   assert.deepEqual(f.publicationOrder, ['register']); assert.deepEqual(f.state.controllers[0].calls, []);
   assert.equal(f.state.controllers[0].listenerCount('change'), 2);
   await previous.holiday.getServiceById('switch', 'holiday').getCharacteristic('on').set(true);
-  assert.equal(previous.home.getServiceById('switch', 'home').getCharacteristic('on').get(), true);
+  assert.equal(previous.home.getServiceById('switch', 'home').getCharacteristic('on').get(), false);
   assert.equal(previous.holiday.getServiceById('switch', 'holiday').getCharacteristic('on').value, true);
   assert.equal(JSON.stringify(f.logEntries).includes('PRIVATE_DETAILS'), false);
   await f.shutdown(); assert.equal(f.state.controllers[0].listenerCount('change'), 0);
