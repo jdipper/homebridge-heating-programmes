@@ -1,0 +1,21 @@
+{
+  "pluginAlias": "HeatingProgrammes",
+  "pluginType": "platform",
+  "singular": true,
+  "customUi": true,
+  "headerDisplay": "One programme editor and household controller for FastWarm and Hive. Account credentials remain in their device plugins.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {"title": "Name", "type": "string", "default": "Heating Programmes"},
+      "useTuya": {"title": "Connect FastWarm through Tuya", "type": "boolean", "default": true},
+      "tuyaInstanceId": {"title": "Tuya connection ID (only needed for multiple instances)", "type": "string"},
+      "useHive": {"title": "Connect Hive", "type": "boolean", "default": true},
+      "hiveTargetLimits": {"title": "Hive programme validation limits", "type": "object", "properties": {
+        "minC": {"title": "Minimum temperature (°C)", "type": "number"},
+        "maxC": {"title": "Maximum temperature (°C)", "type": "number"},
+        "stepC": {"title": "Temperature step (°C)", "type": "number"}
+      }, "required": ["minC", "maxC", "stepC"]}
+    }
+  }
+}

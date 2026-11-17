@@ -1,0 +1,94 @@
+<link rel="stylesheet" href="schedule.css?v=shared-1">
+
+<div id="heating-schedules" class="heating-schedules">
+  <header class="schedule-header">
+    <div>
+      <div class="schedule-eyebrow">HOUSEHOLD HEATING</div>
+      <h2>Rooms &amp; schedules</h2>
+      <p>See each room at a glance, then prepare and apply weekly programmes together.</p>
+    </div>
+    <button id="refresh" class="schedule-button" type="button">Refresh</button>
+  </header>
+
+  <div class="schedule-tabs" role="tablist" aria-label="Plugin views">
+    <button id="schedules-tab" class="schedule-tab active" type="button" role="tab" aria-selected="true" aria-controls="schedules-view">Thermostats</button>
+    <button id="settings-tab" class="schedule-tab" type="button" role="tab" aria-selected="false" aria-controls="settings-view">Settings</button>
+  </div>
+
+  <section id="settings-view" role="tabpanel" aria-labelledby="settings-tab" hidden>
+    <p class="schedule-notice">Shared controller and accessory settings appear below. Device credentials stay in the Hive and Tuya plugins. Use Homebridge's Save button for these settings. Schedule drafts have their own save controls.</p>
+  </section>
+
+  <main id="schedules-view" role="tabpanel" aria-labelledby="schedules-tab">
+    <div id="message" class="schedule-message" role="status" aria-live="polite" hidden></div>
+    <section class="presence-panel" aria-label="Household heating profile">
+      <div>
+        <h3>Household</h3>
+        <p id="household-state">Loading the heating controller…</p>
+      </div>
+      <div class="presence-actions">
+        <button id="home-control" class="schedule-button" type="button">Someone home</button>
+        <button id="away-control" class="schedule-button" type="button">Everyone away</button>
+        <button id="holiday-control" class="schedule-button" type="button">Enable holiday</button>
+      </div>
+      <div id="programme-feedback" class="programme-feedback" role="status" aria-live="polite" aria-atomic="true">
+        <strong id="programme-feedback-title">Checking programme confirmations…</strong>
+        <p id="programme-feedback-detail"></p>
+      </div>
+      <details class="household-options" data-detail="household-options">
+        <summary>Presence, guests &amp; holiday return</summary>
+        <div id="household-options"></div>
+      </details>
+    </section>
+
+    <details class="household-options" id="api-usage-panel">
+      <summary>Tuya API usage</summary>
+      <div id="api-usage-summary" role="status">Usage tracking starts after the Tuya plugin update.</div>
+      <p class="schedule-help">Counts requests made by this Homebridge installation, including authentication and retries. Earlier usage and other apps are excluded. These are observed requests, not Tuya billing totals.</p>
+      <button id="refresh-api-usage" class="schedule-button" type="button">Refresh usage</button>
+    </details>
+
+    <div class="profile-toolbar">
+      <div>
+        <h3>Weekly programmes</h3>
+        <p>Choose Home, Away or Holiday, then prepare programmes for FastWarm and Hive together.</p>
+      </div>
+      <div class="schedule-tabs profile-tabs" role="tablist" aria-label="Schedule profile">
+        <button class="schedule-tab active" data-profile="home" type="button" role="tab" aria-selected="true">Home</button>
+        <button class="schedule-tab" data-profile="away" type="button" role="tab" aria-selected="false">Away</button>
+        <button class="schedule-tab" data-profile="holiday" type="button" role="tab" aria-selected="false">Holiday</button>
+      </div>
+    </div>
+
+    <section class="programme-workflow" aria-label="Programme preparation">
+      <div class="workflow-intro"><strong>1. Choose profile &amp; rooms</strong><span>2. Load or edit drafts</span><span>3. Save, review &amp; apply</span></div>
+      <div class="bulk-actions">
+        <div class="selection-summary"><label class="system-filter">Show <select id="system-filter" aria-label="Filter heating systems"><option value="all">All systems</option><option value="tuya">FastWarm</option><option value="hive">Hive</option></select></label><label class="select-all"><input id="select-all" type="checkbox"> All visible rooms</label><span id="selection-count" class="schedule-help">No rooms selected</span></div>
+        <button id="edit-all" class="schedule-button primary" type="button">Edit programme for visible rooms</button>
+      </div>
+      <div class="bulk-actions programme-actions">
+        <div class="bulk-secondary"><button id="load-stored" class="schedule-button" type="button">Load stored programmes</button><button id="save-selected" class="schedule-button" type="button" disabled>Save selected drafts</button></div>
+        <button id="apply-selected" class="schedule-button primary" type="button" disabled>Review &amp; apply selected</button>
+      </div>
+      <p id="bulk-help" class="schedule-help">Loading reads each room’s programme into its own draft. Drafts do not change the heating.</p>
+    </section>
+    <section id="shared-editor" class="shared-editor" aria-labelledby="shared-editor-title" hidden></section>
+    <div id="thermostats" class="thermostat-list" aria-live="polite"></div>
+    <p class="schedule-footnote">Programme uploads and household changes need Homebridge and the relevant heating connection online. Last-read programmes and saved drafts remain available here on your local network. Incomplete and unverified programmes are shown explicitly.</p>
+  </main>
+
+  <section id="apply-preview" class="apply-preview" role="dialog" aria-modal="true" aria-labelledby="preview-title" hidden>
+    <div class="apply-preview-card">
+      <h3 id="preview-title">Review programme changes</h3>
+      <p id="preview-description"></p>
+      <div id="preview-content"></div>
+      <p id="preview-notice" class="schedule-notice">Each thermostat is updated and verified separately. A connection failure can leave only some rooms updated, or a partial FastWarm programme. Check every room’s confirmation after applying.</p>
+      <div class="preview-actions">
+        <button id="cancel-apply" class="schedule-button" type="button">Cancel</button>
+        <button id="confirm-apply" class="schedule-button primary" type="button">Apply programme changes</button>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script src="schedule.js?v=shared-6"></script>
