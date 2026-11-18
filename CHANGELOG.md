@@ -8,4 +8,4 @@
 - Use FastWarm connection labels for API usage and refresh the editor asset version.
 - Make the legacy compatibility test portable with only the unchanged, hash-pinned read-only validator fixture; no frozen execution or request code is included.
 
-This release is prepared for a reviewed provider migration. Installation and npm publication have not been performed.
+This release has completed a backed-up provider migration and read-only verification with FastWarm `.1`. It has not been published to npm.

@@ -8,10 +8,11 @@ Household heating is already split into device providers and a shared scheduler.
 Do not repeat the old combined-plugin extraction or install its runtime beside
 the shared owner.
 
-| Component | Source | Last verified installed build, 17 November |
+| Component | Source | Verified installed build, 18 November |
 | --- | --- | --- |
-| Heating Programmes | `jdipper/homebridge-heating-programmes` ([PR #2](https://github.com/jdipper/homebridge-heating-programmes/pull/2)) | `0.1.0-jdipper.9` |
-| Tuya device provider | `jdipper/homebridge-tuya` ([PR #4](https://github.com/jdipper/homebridge-tuya/pull/4)) | `2.7.3-jdipper.10` |
+| Heating Programmes | `jdipper/homebridge-heating-programmes`, `feat/fastwarm-local-provider` | `0.1.0-jdipper.10` |
+| FastWarm device provider | [jdipper/homebridge-fastwarm](https://github.com/jdipper/homebridge-fastwarm), `main` | `0.1.0-jdipper.1` |
+| Tuya device provider | `jdipper/homebridge-tuya` | `.13` files retained unconfigured for rollback |
 | Hive device provider | `@jdipper/homebridge-hivehome-control` | `1.1.0-jdipper.4` (unchanged) |
 
 The earlier household-transition updates were merged before their installation:
@@ -47,14 +48,13 @@ were backed up and preserved. The programme-delivery follow-up below supersedes
 that Tuya build; Heating Programmes and Hive remain unchanged. These local builds
 have not been published to npm.
 
-## Dedicated FastWarm adapter (prepared `.10`, not installed)
+## Dedicated FastWarm adapter (installed `.10`)
 
 Heating Programmes `0.1.0-jdipper.10` accepts the dedicated
 `@jdipper/homebridge-fastwarm` provider as well as `@jdipper/homebridge-tuya`.
-The dedicated provider's prepared build is `0.1.0-jdipper.1`. This section records
-source and offline validation; it does not claim a completed installation,
-Homebridge accessory migration or npm publication. The installed checkpoint
-table above remains historical.
+The dedicated provider's installed build is `0.1.0-jdipper.1`. The checked pair
+completed a backed-up accessory-ownership migration and one main Homebridge
+restart. These local builds have not been published to npm.
 
 Only these two provider package identities are accepted. Descriptor version,
 owner-only files/socket, live process, instance and bearer-token checks remain
@@ -75,9 +75,27 @@ The UI's script version matches its content hash, and API-usage copy identifies
 FastWarm connections. The compatibility suite now uses a portable fixture
 containing only the unchanged, hash-pinned legacy read-only programme validator.
 It does not load the original probe's entry point, requests or private setup.
-The prepared `.10` build passes the complete **301-test** offline Shared suite,
+The `.10` build passes the complete **301-test** offline Shared suite,
 including both provider identities, preview invalidation and the portable
 compatibility fixture.
+
+The post-migration proof verified all 168 stored FastWarm periods and six fresh
+Home targets through the running native provider, with zero Tuya HTTP attempts
+and no heating-setting writes. A process-bound socket check found six established
+LAN sessions and no public TCP connections. Private keys/metadata, profiles,
+household policy, programme history, grouped control identities and all HAP
+pairing/AID/IID maps were preserved. Hive remained online with its stored week
+unchanged. Home is selected, Holiday off. A missing preflight confirmation was
+restored by one read-only refresh before migration; it did not rewrite a week.
+
+Source checkpoint: `5cb96f0dd95ccbb219b9f8f1834238f9bc49baea`. The installed
+Shared archive SHA256 is `d529847f9bc90b3da58e6347eb868659ab4be33dd635d357230cdea1dc7bce1b`.
+Its bundled README records the pre-install candidate; later documentation commits
+do not replace immutable archives or change installed runtime code.
+See the [dedicated provider handover](https://github.com/jdipper/homebridge-fastwarm/blob/main/docs/codex-handover.md)
+for the paired archive and verification scope. No live schedules or targets were
+changed by extraction. Broad LAN multi-period writes and deliberate WAN loss
+remain separate hardware-validation work.
 
 ## Programme delivery follow-up (installed and hardware checked)
 

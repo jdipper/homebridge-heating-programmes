@@ -9,8 +9,9 @@ accessory containing independent Home and Holiday switches in Apple Home.
 This development build is **0.1.0-jdipper.10**. It adds support for the dedicated
 **`@jdipper/homebridge-fastwarm` 0.1.0-jdipper.1** provider while retaining the
 existing Tuya device-provider contract and scoped Hive provider
-**`@jdipper/homebridge-hivehome-control` 1.1.0-jdipper.4**. These prepared changes
-have not yet been installed or published to npm.
+**`@jdipper/homebridge-hivehome-control` 1.1.0-jdipper.4**. The `.10` / FastWarm `.1`
+pair has completed a backed-up installation and read-only native verification.
+These local builds have not been published to npm.
 The existing unscoped Hive provider build **1.1.0-jdipper.2** remains compatible
 while an installation moves to the scoped package. Do not run the old Tuya household controller
 alongside it; startup checks and an exclusive private owner lock prevent two
