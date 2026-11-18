@@ -9,7 +9,7 @@ import {isThermostatTimeZone} from '../controller/NowNext';
 interface Descriptor {
   version: 1;
   protocolVersion: 1;
-  plugin: '@jdipper/homebridge-tuya';
+  plugin: '@jdipper/homebridge-tuya' | '@jdipper/homebridge-fastwarm';
   instanceId: string;
   pid: number;
   socketPath: string;
@@ -118,7 +118,8 @@ export class TuyaIpcTransport implements ProgrammeProvider {
     let descriptor: Descriptor;
     try {
       descriptor = await this.descriptor();
-      if (descriptor.instanceId !== owner.descriptor.instanceId || descriptor.pid !== owner.descriptor.pid
+      if (descriptor.plugin !== owner.descriptor.plugin
+        || descriptor.instanceId !== owner.descriptor.instanceId || descriptor.pid !== owner.descriptor.pid
         || descriptor.token !== owner.descriptor.token
         || (owner.automatic && descriptor.capabilities?.automaticFreshBaseline !== true)
         || (owner.activeTarget && descriptor.capabilities?.activeTargetAlignment !== true)) throw new Error('runtime changed');
@@ -192,7 +193,8 @@ export class TuyaIpcTransport implements ProgrammeProvider {
   private async discardOwner(token: string, owner: PreparedOwner): Promise<void> {
     if (!owner?.automatic) return;
     const descriptor = await this.descriptor();
-    if (descriptor.instanceId !== owner.descriptor.instanceId || descriptor.pid !== owner.descriptor.pid
+    if (descriptor.plugin !== owner.descriptor.plugin
+      || descriptor.instanceId !== owner.descriptor.instanceId || descriptor.pid !== owner.descriptor.pid
       || descriptor.token !== owner.descriptor.token) return;
     const body = await this.call(descriptor, '/provider/discard', {token}, false);
     requireProgramme(body.discarded === true, 'TUYA_IPC_DISCARD_NOT_CONFIRMED');
@@ -309,7 +311,9 @@ export class TuyaIpcTransport implements ProgrammeProvider {
         await file.close();
       }
       requireProgramme(isRecord(value) && value.version === 1 && value.protocolVersion === 1
-        && value.plugin === '@jdipper/homebridge-tuya' && typeof value.instanceId === 'string'
+        // Preserve the existing private IPC namespace and logical tuya: room IDs during this package migration.
+        && (value.plugin === '@jdipper/homebridge-tuya' || value.plugin === '@jdipper/homebridge-fastwarm')
+        && typeof value.instanceId === 'string'
         && /^[a-f0-9]{16}$/.test(value.instanceId) && name === `TuyaProgrammeProvider.${value.instanceId}.json`
         && typeof value.pid === 'number' && Number.isSafeInteger(value.pid) && value.pid > 0
         && typeof value.token === 'string' && /^[a-f0-9]{64}$/.test(value.token)
@@ -327,7 +331,7 @@ export class TuyaIpcTransport implements ProgrammeProvider {
       process.kill(descriptor.pid, 0);
       return descriptor;
     } catch {
-      throw new Error('The FastWarm programme connection is unavailable. Start its Tuya bridge and choose one instance.');
+      throw new Error('The FastWarm programme connection is unavailable. Start its FastWarm bridge and choose one instance.');
     }
   }
 

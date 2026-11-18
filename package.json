@@ -1,6 +1,6 @@
 {
   "name": "@jdipper/homebridge-heating-programmes",
-  "version": "0.1.0-jdipper.9",
+  "version": "0.1.0-jdipper.10",
   "private": true,
   "description": "Shared household heating programmes for FastWarm and Hive.",
   "repository": {

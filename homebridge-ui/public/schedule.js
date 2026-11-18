@@ -1709,12 +1709,12 @@ if (typeof module === 'object' && module.exports) {
       const records = response && Array.isArray(response.records) ? response.records : [];
       target.replaceChildren();
       if (!records.length) {
-        target.append(element('p', 'schedule-help', 'No usage has been recorded yet. Tracking starts with the updated Tuya plugin.'));
+        target.append(element('p', 'schedule-help', 'No usage has been recorded yet. Tracking starts when a FastWarm connection records requests.'));
       }
       for (const [index, record] of records.entries()) {
         const month = new Date(`${record.month}-01T00:00:00Z`).toLocaleDateString(undefined,
           {month: 'long', year: 'numeric', timeZone: 'UTC'});
-        const label = records.length > 1 ? `Tuya connection ${index + 1}: ` : '';
+        const label = records.length > 1 ? `FastWarm connection ${index + 1}: ` : '';
         target.append(element('p', '', `${label}${Number(record.attempts).toLocaleString()} requests recorded · ${month}`));
         target.append(element('p', 'schedule-help', `Recorded since ${new Date(record.observedSince).toLocaleString()}. Last request ${new Date(record.updatedAt).toLocaleString()}.`));
         const categories = {authentication: 'Authentication', messaging: 'Push connection', temperature: 'Temperature recovery',

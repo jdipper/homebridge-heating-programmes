@@ -119,14 +119,14 @@ test('the unchanged frozen probe validator accepts a fresh read from the alias',
   assert.equal(read.status, 200);
   await f.controller.idle();
   const response = await request(f.descriptor, '/thermostats');
-  const frozenSource = await fs.readFile(path.join(__dirname, '../../npm-publication-20261108/boundary-preview/probe.cjs'), 'utf8');
-  const start = frozenSource.indexOf('function validateProgramme('), end = frozenSource.indexOf('\nasync function programme(', start);
-  assert.ok(start >= 0 && end > start);
-  // Compile only the read-only validation function. The frozen file's executable
-  // entry point and all cloud/API code are never evaluated by this test.
+  const frozenValidator = await fs.readFile(path.join(__dirname, 'fixtures/legacy-validate-programme.cjs'), 'utf8');
+  assert.equal(createHash('sha256').update(frozenValidator).digest('hex'),
+    '32eddb95674d9550800a37f8ad1ace381b8e3859529637444dc708dcdc520c19');
+  // This portable fixture is only the unchanged read-only validation function;
+  // its pinned body excludes the original probe's entry point and request code.
   const context = vm.createContext({ TARGET: target, EXPECTED_FINGERPRINT: fingerprint(week()), createHash,
     journal: {}, save() {}, Date, programmeVerifiedAt: 0 });
-  vm.runInContext(`${frozenSource.slice(start, end)}\nthis.validate = validateProgramme;`, context);
+  vm.runInContext(`${frozenValidator}\nthis.validate = validateProgramme;`, context);
   const validated = context.validate(response.body, started);
   assert.equal(validated.id, target);
   assert.equal(validated.sync.status, 'verified');

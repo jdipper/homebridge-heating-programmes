@@ -1,18 +1,28 @@
 # Heating Programmes
 
-One Homebridge editor and household controller for FastWarm and Hive. The vendor
-plugins retain account sign-in, normal device accessories, and native device
+One Homebridge editor and household controller for FastWarm and Hive. Device
+providers retain their connections, normal device accessories and native device
 operations. This plugin owns saved Home/Away/Holiday programmes, household
 presence, guest hold, Holiday return/preheat, history, and one Heating
 accessory containing independent Home and Holiday switches in Apple Home.
 
-This local development build is **0.1.0-jdipper.9**. It is not an npm publication.
-Install it together with the Tuya device-provider build **2.7.3-jdipper.9** and the
-scoped Hive provider **`@jdipper/homebridge-hivehome-control` 1.1.0-jdipper.4**.
+This development build is **0.1.0-jdipper.10**. It adds support for the dedicated
+**`@jdipper/homebridge-fastwarm` 0.1.0-jdipper.1** provider while retaining the
+existing Tuya device-provider contract and scoped Hive provider
+**`@jdipper/homebridge-hivehome-control` 1.1.0-jdipper.4**. These prepared changes
+have not yet been installed or published to npm.
 The existing unscoped Hive provider build **1.1.0-jdipper.2** remains compatible
 while an installation moves to the scoped package. Do not run the old Tuya household controller
 alongside it; startup checks and an exclusive private owner lock prevent two
 controllers from managing the same household.
+
+The dedicated FastWarm provider uses LAN connections for readings, controls and
+native schedules; SmartLife metadata import is optional and explicit. Its shared
+room IDs remain `tuya:<deviceId>` so existing profiles, history and household
+enrollment retain their identity. The Home/Holiday accessory and Hive connection
+are unchanged. Replacing the Tuya device provider requires a reviewed Homebridge
+accessory-ownership and pairing migration; matching device UUIDs alone do not
+perform that migration. Stop the old provider before starting its replacement.
 
 ## Using the editor
 
@@ -34,8 +44,9 @@ require both the complete stored week and a fresh matching native target. The ro
 configured IANA time zone determines the active period; a time-zone edit invalidates
 a reviewed preview or cancels obsolete automatic work. A target already matching
 requires no extra command. A differing target normally adds one individual target
-command and one read, with bounded read-only rechecks for delayed reports. Grouped
-programme uploads and their existing API savings are retained.
+command and one read, with bounded read-only rechecks for delayed reports. Existing
+Tuya cloud grouping and API savings are retained. The dedicated provider uses LAN
+requests and paced individual event/day packets with full-week verification.
 
 Save all three profiles before enabling automatic household changes for a room.
 Hive is initially read-only until uploads and that specific zone are deliberately
@@ -65,8 +76,9 @@ Home switch uses the explicit `/home` selection, which ends Holiday when turned 
 The same selection applies to enrolled rooms in both systems. Configure Apple
 Home's first-person-arrives and last-person-leaves automations on the shared
 Home switch inside Heating. Holiday return time and optional preheat lead are edited
-in Homebridge. These deadlines require Homebridge and the provider's internet
-connection. Device execution of the uploaded week during an outage, clock
+in Homebridge. These deadlines require Homebridge and an available provider
+connection: LAN for the dedicated FastWarm provider, internet for cloud providers.
+Device execution of the uploaded week during an outage, clock
 retention, and radiator-valve writes still need their own hardware validation.
 
 Homebridge no longer delays a departure. If an Apple Home automation or shortcut

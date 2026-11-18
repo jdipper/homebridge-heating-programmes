@@ -5,6 +5,8 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const {TuyaIpcTransport} = require('../dist/tuya/TuyaIpcTransport.js');
+const {HeatingController} = require('../dist/controller/Controller.js');
+const {toEditor} = require('../dist/controller/EditorProgramme.js');
 
 const weekdays = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
 const week = targetC => Object.fromEntries(weekdays.map(day => [day,
@@ -88,6 +90,67 @@ test('device connection lists and reads the real shape over authenticated privat
     {route: '/provider/list', method: 'POST', body: {}},
     {route: '/provider/read', method: 'POST', body: {deviceId}},
   ]);
+});
+
+test('the dedicated FastWarm package uses the same authenticated IPC namespace and logical provider identity', async t => {
+  const {client, seen, zone} = await fixture(t, {descriptor: {plugin: '@jdipper/homebridge-fastwarm'}});
+  assert.equal(client.id, 'tuya'); assert.equal(client.title, 'FastWarm');
+  assert.deepEqual(await client.list(), [zone]);
+  assert.deepEqual(await client.read(deviceId), zone);
+  const preview = await client.prepare(deviceId, desired, zone.fingerprint);
+  assert.equal((await client.apply(preview.token)).status, 'confirmed');
+  assert.deepEqual(seen.map(call => call.route), ['/provider/list', '/provider/read', '/provider/prepare', '/provider/apply']);
+});
+
+test('switching packages preserves saved tuya room IDs, all profiles and programme history without heating writes', async t => {
+  const f = await fixture(t);
+  const stateFile = path.join(f.persist, 'HeatingProgrammes.json'), roomId = `tuya:${deviceId}`;
+  let controller;
+  t.after(async () => { await controller?.close(); });
+  controller = new HeatingController(f.persist, [f.client], {warn() {}});
+  await controller.start({publishServer: false, poll: false, migrate: false});
+  for (const [profile, temperature] of [['home', 19], ['away', 12], ['holiday', 10]]) {
+    await controller.handle('/profiles/save', {deviceId: roomId, profile, schedule: toEditor(week(temperature))});
+  }
+  await controller.close();
+  const before = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+  assert.deepEqual(Object.keys(before.rooms), [roomId]);
+  assert.ok(before.history.devices[roomId].programmes.length >= 3);
+  await fs.writeFile(f.descriptorPath, JSON.stringify({...f.descriptor, plugin: '@jdipper/homebridge-fastwarm'}), {mode: 0o600});
+  controller = new HeatingController(f.persist, [new TuyaIpcTransport({storagePath: f.root})], {warn() {}});
+  await controller.start({publishServer: false, poll: false, migrate: false});
+  const after = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+  assert.deepEqual(Object.keys(after.rooms), [roomId]);
+  assert.equal(after.rooms[roomId].provider, 'tuya'); assert.equal(after.rooms[roomId].deviceId, deviceId);
+  assert.deepEqual(after.rooms[roomId].profiles, before.rooms[roomId].profiles);
+  assert.deepEqual(after.history.devices[roomId], before.history.devices[roomId]);
+  assert.equal(controller.view().thermostats[0].id, roomId);
+  assert.ok(f.seen.every(call => call.route === '/provider/list'));
+});
+
+test('changing even between approved package identities invalidates an existing preview before dispatch', async t => {
+  const f = await fixture(t);
+  const preview = await f.client.prepare(deviceId, desired, f.zone.fingerprint);
+  await fs.writeFile(f.descriptorPath, JSON.stringify({...f.descriptor, plugin: '@jdipper/homebridge-fastwarm'}), {mode: 0o600});
+  const result = await f.client.apply(preview.token);
+  assert.equal(result.status, 'not-applied'); assert.equal(result.writeAttempted, false);
+  assert.deepEqual(f.seen.map(call => call.route), ['/provider/prepare']);
+});
+
+for (const [name, options] of [
+  ['package lookalike', {descriptor: {plugin: '@jdipper/homebridge-fastwarm-extra'}}],
+  ['unscoped package', {descriptor: {plugin: 'homebridge-fastwarm'}}],
+  ['foreign scope', {descriptor: {plugin: '@someone/homebridge-fastwarm'}}],
+  ['short token', {descriptor: {plugin: '@jdipper/homebridge-fastwarm', token: 'bad'}}],
+  ['wrong instance', {descriptor: {plugin: '@jdipper/homebridge-fastwarm', instanceId: 'e'.repeat(16)}}],
+  ['outside socket', {descriptor: {plugin: '@jdipper/homebridge-fastwarm', socketPath: '/tmp/foreign.sock'}}],
+  ['non-live process', {descriptor: {plugin: '@jdipper/homebridge-fastwarm', pid: 99_999_999}}],
+  ['public descriptor', {descriptor: {plugin: '@jdipper/homebridge-fastwarm'}, mode: 0o644}],
+  ['public socket', {descriptor: {plugin: '@jdipper/homebridge-fastwarm'}, socketMode: 0o666}],
+]) test(`dedicated FastWarm rejects ${name} before any IPC dispatch`, async t => {
+  const f = await fixture(t, options);
+  await assert.rejects(f.client.list(), /connection is unavailable/);
+  assert.equal(f.seen.length, 0);
 });
 
 test('a pre-aborted automatic apply consumes its preview and releases the owned lease without an apply request', async t => {
